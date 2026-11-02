@@ -365,7 +365,20 @@ class Telegram:
         return self.call("sendMessage", chat_id=self.chat, text=text)
 
 
+def load_env_file(path="compass.env"):
+    """Optional KEY=VALUE file next to the script (used on shared hosting)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    full = os.path.join(here, path)
+    if os.path.exists(full):
+        for line in open(full, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
 def main():
+    load_env_file()
     token, chat = os.environ["TELEGRAM_TOKEN"], os.environ["CHAT_ID"]
     dry = os.environ.get("DRY_RUN") == "1"
     now = datetime.fromisoformat(os.environ["FAKE_NOW"]).replace(tzinfo=TZ) if os.environ.get("FAKE_NOW") else datetime.now(TZ)
