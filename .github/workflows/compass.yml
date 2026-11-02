@@ -1,0 +1,41 @@
+name: Compass
+
+on:
+  schedule:
+    # Every 10 minutes from 04:00 to 21:59 Nairobi time (UTC+3). GitHub cron is in UTC.
+    - cron: "*/10 1-18 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: compass
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  compass:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Compass
+        run: python3 bot.py
+
+      - name: Cache voice model
+        if: hashFiles('voice_text.txt') != ''
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: kokoro-v1.0
+
+      - name: Send voice note
+        if: hashFiles('voice_text.txt') != ''
+        run: |
+          sudo apt-get install -y -q ffmpeg
+          pip install -q kokoro-onnx soundfile
+          python3 voice.py
