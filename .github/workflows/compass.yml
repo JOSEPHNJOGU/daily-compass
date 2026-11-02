@@ -5,6 +5,11 @@ on:
     # Every 10 minutes from 04:00 to 21:59 Nairobi time (UTC+3). GitHub cron is in UTC.
     - cron: "*/10 1-18 * * *"
   workflow_dispatch:
+    inputs:
+      test_time:
+        description: "Optional safe test: pretend it is this time (HH:MM, e.g. 05:05) on Day 1. Sends labelled test messages and changes nothing."
+        required: false
+        default: ""
 
 concurrency:
   group: compass
@@ -20,6 +25,7 @@ jobs:
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       CHAT_ID: ${{ secrets.CHAT_ID }}
+      TEST_TIME: ${{ github.event.inputs.test_time }}
     steps:
       - uses: actions/checkout@v4
 

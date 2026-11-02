@@ -371,6 +371,26 @@ def main():
     now = datetime.fromisoformat(os.environ["FAKE_NOW"]).replace(tzinfo=TZ) if os.environ.get("FAKE_NOW") else datetime.now(TZ)
     tg = Telegram(token, chat, dry)
 
+    test_time = os.environ.get("TEST_TIME", "").strip()
+    if test_time:
+        # Safe test mode: play a fake morning at TEST_TIME on Day 1. Reads your rules and book
+        # from the tracker but never edits it and never reads your messages.
+        _, old_text = tg.tracker()
+        st = parse(old_text) if old_text else dict(DEFAULT, sent=[])
+        h, m = test_time.split(":")
+        now = datetime(START.year, START.month, START.day, int(h), int(m), tzinfo=TZ)
+        st.update(day=1, today=str(START), wake_t="-", workout_t="-", work_t="-", left_t="-", sent=[])
+        st, out, voice = run(st, [], now)
+        for text in out:
+            tg.send(f"🧪 TEST ({test_time}): {text}")
+        if not out:
+            tg.send(f"🧪 TEST ({test_time}): nothing would be sent at this time.")
+        if voice:
+            with open("voice_text.txt", "w") as f:
+                f.write(voice)
+        print(f"test ok {test_time} sent={len(out)}")
+        return
+
     mid, old_text = tg.tracker()
     st = parse(old_text) if old_text else dict(DEFAULT, sent=[])
 
