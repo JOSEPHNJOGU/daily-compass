@@ -1,9 +1,10 @@
 name: Compass
 
 on:
-  schedule:
-    # Every 5 minutes (at :02, :07, :12 ...) from 04:00 to 21:59 Nairobi time (UTC+3). GitHub cron is in UTC.
-    - cron: "2-59/5 1-18 * * *"
+  # The schedule is switched off while the bot runs on HostAfrica (only one copy may read the messages).
+  # To go back to GitHub, add it again:
+  #   schedule:
+  #     - cron: "2-59/5 1-18 * * *"
   workflow_dispatch:
     inputs:
       test_time:

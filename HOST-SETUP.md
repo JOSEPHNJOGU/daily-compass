@@ -14,7 +14,9 @@ Each run takes a second or two, reads your messages, replies and exits.
    You should get "Hello from your hosting!" in Telegram. If you have no terminal, create a cron job
    that runs the same command once, then read its output or just look for the Telegram message.
 6. Add the cron job: **Cron Jobs**, every minute (`* * * * *`), command:
-   `cd /home/YOURUSER/compass && /usr/bin/python3 bot.py >> run.log 2>&1`
+   `cd ~/domains/compass && python3 bot.py --loop >> run.log 2>&1`
+   The `--loop` part keeps each run listening for about 58 seconds, so replies take a couple of seconds
+   instead of up to a minute. A lock file makes sure only one copy listens at a time.
    (Use the Python path your panel shows, for example `python3` or `/usr/local/bin/python3`.)
 7. Tell Claude it runs. Claude then switches off GitHub's schedule so only one copy reads your messages.
 

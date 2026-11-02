@@ -377,40 +377,16 @@ def load_env_file(path="compass.env"):
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def main():
-    load_env_file()
-    token, chat = os.environ["TELEGRAM_TOKEN"], os.environ["CHAT_ID"]
-    dry = os.environ.get("DRY_RUN") == "1"
-    now = datetime.fromisoformat(os.environ["FAKE_NOW"]).replace(tzinfo=TZ) if os.environ.get("FAKE_NOW") else datetime.now(TZ)
-    tg = Telegram(token, chat, dry)
-
-    test_time = os.environ.get("TEST_TIME", "").strip()
-    if test_time:
-        # Safe test mode: play a fake morning at TEST_TIME on Day 1. Reads your rules and book
-        # from the tracker but never edits it and never reads your messages.
-        _, old_text = tg.tracker()
-        st = parse(old_text) if old_text else dict(DEFAULT, sent=[])
-        h, m = test_time.split(":")
-        now = datetime(START.year, START.month, START.day, int(h), int(m), tzinfo=TZ)
-        st.update(day=1, today=str(START), wake_t="-", workout_t="-", work_t="-", left_t="-", sent=[])
-        st, out, voice = run(st, [], now)
-        for text in out:
-            tg.send(f"🧪 TEST ({test_time}): {text}")
-        if not out:
-            tg.send(f"🧪 TEST ({test_time}): nothing would be sent at this time.")
-        if voice:
-            with open("voice_text.txt", "w") as f:
-                f.write(voice)
-        print(f"test ok {test_time} sent={len(out)}")
-        return
-
+def cycle(tg, chat, dry, fake_now=None, poll=0):
+    """One read-reply-save pass. With poll > 0, waits up to that many seconds for new messages."""
     mid, old_text = tg.tracker()
     st = parse(old_text) if old_text else dict(DEFAULT, sent=[])
 
-    r = tg.call("getUpdates", offset=st["last_id"] + 1, timeout=0, allowed_updates=json.dumps(["message"]))
+    r = tg.call("getUpdates", offset=st["last_id"] + 1, timeout=poll, allowed_updates=json.dumps(["message"]))
     if not r.get("ok"):
         print("getUpdates failed:", r)
-        sys.exit(1)
+        return False
+    now = fake_now or datetime.now(TZ)
     updates = [u for u in r["result"] if str((u.get("message") or {}).get("chat", {}).get("id")) == str(chat)]
     if r["result"]:
         st["last_id"] = max(u["update_id"] for u in r["result"])
@@ -433,7 +409,69 @@ def main():
             res = tg.send(text)
             if not dry and res.get("ok"):
                 tg.call("pinChatMessage", chat_id=chat, message_id=res["result"]["message_id"], disable_notification="true")
-    print(f"ok {now:%Y-%m-%d %H:%M} messages={len(updates)} sent={len(out)}")
+    if updates or out:
+        print(f"ok {now:%Y-%m-%d %H:%M:%S} messages={len(updates)} sent={len(out)}")
+    return True
+
+
+def main():
+    load_env_file()
+    token, chat = os.environ["TELEGRAM_TOKEN"], os.environ["CHAT_ID"]
+    dry = os.environ.get("DRY_RUN") == "1"
+    fake_now = datetime.fromisoformat(os.environ["FAKE_NOW"]).replace(tzinfo=TZ) if os.environ.get("FAKE_NOW") else None
+    tg = Telegram(token, chat, dry)
+
+    test_time = os.environ.get("TEST_TIME", "").strip()
+    if test_time:
+        # Safe test mode: play a fake morning at TEST_TIME on Day 1. Reads your rules and book
+        # from the tracker but never edits it and never reads your messages.
+        _, old_text = tg.tracker()
+        st = parse(old_text) if old_text else dict(DEFAULT, sent=[])
+        h, m = test_time.split(":")
+        now = datetime(START.year, START.month, START.day, int(h), int(m), tzinfo=TZ)
+        st.update(day=1, today=str(START), wake_t="-", workout_t="-", work_t="-", left_t="-", sent=[])
+        st, out, voice = run(st, [], now)
+        for text in out:
+            tg.send(f"🧪 TEST ({test_time}): {text}")
+        if not out:
+            tg.send(f"🧪 TEST ({test_time}): nothing would be sent at this time.")
+        if voice:
+            with open("voice_text.txt", "w") as f:
+                f.write(voice)
+        print(f"test ok {test_time} sent={len(out)}")
+        return
+
+    if "--loop" in sys.argv:
+        # Stay alive about a minute, listening for messages (for a cron job that starts every minute).
+        # A lock file makes sure only one copy listens at a time.
+        import time
+        try:
+            import fcntl
+            lock = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".lock"), "w")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            pass
+        except OSError:
+            print("another copy is already listening, exiting")
+            return
+        idx = sys.argv.index("--loop") + 1
+        seconds = int(sys.argv[idx]) if idx < len(sys.argv) and sys.argv[idx].isdigit() else 58
+        end = time.time() + seconds
+        while True:
+            left = end - time.time()
+            if left <= 3:
+                break
+            try:
+                ok = cycle(tg, chat, dry, fake_now, poll=int(min(10, left - 2)))
+            except Exception as e:  # keep listening through brief network errors
+                print("cycle error:", type(e).__name__, e)
+                ok = False
+            if not ok:
+                time.sleep(2)
+        return
+
+    if not cycle(tg, chat, dry, fake_now):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
