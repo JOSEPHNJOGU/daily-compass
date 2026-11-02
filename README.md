@@ -1,10 +1,10 @@
 # Joseph's Daily Compass (GitHub Actions)
 
-A Telegram accountability bot. It runs every 10 minutes on GitHub for free, replies to your
+A Telegram accountability bot. It runs every 5 minutes on GitHub for free, replies to your
 check-ins, sends nudges, and keeps your streak in the pinned Telegram tracker message.
 No Claude usage, no server.
 
-## Setup (about 10 minutes)
+## Setup (about 5 minutes)
 
 1. On github.com, create a **new public repository**, e.g. `daily-compass`. (Public repos get
    unlimited free Actions minutes. The code contains no secrets and no personal data.)
