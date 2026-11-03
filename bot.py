@@ -1552,9 +1552,19 @@ class Telegram:
             return json.loads(e.read().decode() or "{}")
 
     def tracker(self):
-        r = self.call("getChat", chat_id=self.chat)
-        pm = (r.get("result") or {}).get("pinned_message")
-        return (pm["message_id"], pm["text"]) if pm else (None, None)
+        """(message id, text) of the pinned tracker; (None, None) only if it is really missing.
+        A failed request raises, so a Telegram hiccup can never be mistaken for a lost tracker."""
+        import time
+        for attempt in range(2):
+            r = self.call("getChat", chat_id=self.chat)
+            if not r.get("ok"):
+                raise RuntimeError("getChat failed: " + str(r)[:100])
+            pm = (r.get("result") or {}).get("pinned_message")
+            if pm and "COMPASS TRACKER" in (pm.get("text") or ""):
+                return pm["message_id"], pm["text"]
+            if attempt == 0:
+                time.sleep(1.5)  # ask once more before deciding it is gone
+        return None, None
 
     def send_document(self, path, caption=""):
         if self.dry:
