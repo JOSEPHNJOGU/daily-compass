@@ -18,7 +18,14 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
 TZ = timezone(timedelta(hours=3))  # Nairobi, no daylight saving
-START = date(2026, 11, 3)          # Day 1
+
+
+def pdate(s):
+    """Parse YYYY-MM-DD (works on old Python versions, unlike the newer helper)."""
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+START = pdate(os.environ.get("COMPASS_START", "2026-11-04"))  # Day 1
 NAME = "Joseph"
 MAX_REMINDERS = 25
 HIST_KEEP = 120                    # days of history kept in the tracker
@@ -188,7 +195,7 @@ def day_set(st, d, ch=None, mood=None):
         return
     if st["hist_start"] == "-":
         st["hist_start"] = str(d)
-    start = date.fromisoformat(st["hist_start"])
+    start = pdate(st["hist_start"])
     i = (d - start).days
     if i < 0:
         return
@@ -207,7 +214,7 @@ def day_set(st, d, ch=None, mood=None):
 def hist_items(st):
     if st["hist_start"] == "-":
         return []
-    start = date.fromisoformat(st["hist_start"])
+    start = pdate(st["hist_start"])
     return [(start + timedelta(days=i), c) for i, c in enumerate(st["hist"])]
 
 
@@ -302,7 +309,7 @@ def parse_reminder(arg, today, cur):
         parts = [p for p in w.split(",") if p]
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", w):
             try:
-                date.fromisoformat(w)
+                pdate(w)
             except ValueError:
                 return None, "That date doesn't look right. Use YYYY-MM-DD."
             rule, used[i] = f"once:{w}", True
@@ -762,7 +769,7 @@ def run(st, updates, now):
         old = st["today"]
         if started and old != "none" and st["reviewed"] != old:
             try:
-                od = date.fromisoformat(old)
+                od = pdate(old)
                 if od >= START:
                     out.append(f"I closed out yesterday for you, {NAME}. " + close_day(st, od))
             except ValueError:
@@ -1206,6 +1213,19 @@ def take_lock(path):
     return None
 
 
+def alert(tg, text):
+    """Tell Joseph once an hour at most that something is wrong."""
+    import time
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".alert")
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 3600:
+            return
+        open(path, "w").write(str(time.time()))
+        tg.send("⚠️ " + text)
+    except Exception:
+        pass
+
+
 def heartbeat(lock):
     import time
     try:
@@ -1223,7 +1243,7 @@ def main():
     load_env_file()
     token, chat = os.environ["TELEGRAM_TOKEN"], os.environ["CHAT_ID"]
     dry = os.environ.get("DRY_RUN") == "1"
-    fake_now = datetime.fromisoformat(os.environ["FAKE_NOW"]).replace(tzinfo=TZ) if os.environ.get("FAKE_NOW") else None
+    fake_now = datetime.strptime(os.environ["FAKE_NOW"], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=TZ) if os.environ.get("FAKE_NOW") else None
     tg = Telegram(token, chat, dry)
 
     test_time = os.environ.get("TEST_TIME", "").strip()
@@ -1258,6 +1278,7 @@ def main():
         seconds = int(sys.argv[idx]) if idx < len(sys.argv) and sys.argv[idx].isdigit() else 58
         hard_stop(seconds + 25)
         end = time.time() + seconds
+        errors = 0
         while True:
             left = end - time.time()
             if left <= 3:
@@ -1265,15 +1286,30 @@ def main():
             heartbeat(lock)
             try:
                 ok = cycle(tg, chat, dry, fake_now, poll=int(min(10, left - 2)))
+                errors = 0 if ok else errors
             except Exception as e:  # keep listening through brief network errors
+                import traceback
+                errors += 1
                 print("cycle error:", type(e).__name__, e)
+                if errors == 1:
+                    traceback.print_exc()
+                if errors >= 3:
+                    alert(tg, f"The Compass hit an error ({type(e).__name__}: {e}). I'll keep retrying. Please check run.log.")
+                    return  # stop this run; the next cron minute tries again, without flooding the log
                 ok = False
             if not ok:
-                time.sleep(2)
+                time.sleep(3)
         return
 
     hard_stop(75)
-    if not cycle(tg, chat, dry, fake_now):
+    try:
+        ok = cycle(tg, chat, dry, fake_now)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        alert(tg, f"The Compass hit an error ({type(e).__name__}: {e}). Please check run.log.")
+        sys.exit(1)
+    if not ok:
         sys.exit(1)
 
 
