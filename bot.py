@@ -27,10 +27,19 @@ def pdate(s):
 
 START = pdate(os.environ.get("COMPASS_START", "2026-11-04"))  # Day 1
 NAME = "Joseph"
-MAX_REMINDERS = 25
-HIST_KEEP = 120                    # days of history kept in the tracker
+MAX_REMINDERS = 20
+HIST_KEEP = 90                     # days of history kept in the tracker
 DEFAULT_TIMES = dict(wakecall="05:00", midday="12:30", leavecheck="17:30", review="21:00")
-DEFAULT_TARGETS = dict(water=3000, pages=10, glass=500, photo=1, outdoor=1)
+DEFAULT_TARGETS = dict(water=3000, pages=10, glass=500, photo=1, outdoor=1, screen=0)
+CMDVER = 3                         # bump to re-register the "/" command menu
+REFLECT_AT = "23:20"               # when the nightly Claude reflection runs
+AWAIT_HOURS = 3                    # an unanswered wind-down question expires after this long
+EMOTIONS = [("good", "😊"), ("calm", "😌"), ("stressed", "😰"), ("low", "😔"), ("frustrated", "😤"), ("tired", "😴")]
+EMO_CH = {"good": "g", "calm": "c", "stressed": "s", "low": "l", "frustrated": "f", "tired": "t"}
+CH_EMO = {v: k for k, v in EMO_CH.items()}
+EMO_FACE = dict(EMOTIONS)
+SEQ = ("hist", "moods", "emos", "screens")
+SCR_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 DEFAULT = dict(
     day=0, streak=0, slips=0, week="2026-11-02",
@@ -40,7 +49,9 @@ DEFAULT = dict(
     last_id=0, notes="-", updated="setup", times=None, reminders=None,
     started="-", best=0, freezes=0, buddy="off", quiet="22:30-05:00", reviewed="-",
     targets=None, water=0, pages=0, photo_t="-", outdoor_t="-", mood="-",
-    hist_start="-", hist="", moods="",
+    hist_start="-", hist="", moods="", emos="", screens="",
+    aw_state="-", aw_emo="-", aw_at="-",
+    ev_date="-", ev_screen="-", ev_emo="-", ev_why="-", ev_diary="-", ev_shot="-", cmdver=0,
 )
 
 
@@ -68,17 +79,29 @@ def parse(text):
     m = re.search(r"Started: (\S+) \| Best: (\d+) \| Freezes: (\d+) \| Buddy: (\S+) \| Quiet: (\S+) \| Reviewed: (\S+)", text)
     if m:
         s["started"], s["best"], s["freezes"], s["buddy"], s["quiet"], s["reviewed"] = m[1], int(m[2]), int(m[3]), m[4], m[5], m[6]
-    m = re.search(r"Targets: water (\d+) \| pages (\d+) \| glass (\d+) \| photo (on|off) \| outdoor (on|off)", text)
+    m = re.search(r"Targets: water (\d+) \| pages (\d+) \| glass (\d+) \| photo (on|off) \| outdoor (on|off)(?: \| screen (\d+))?", text)
     if m:
-        s["targets"] = dict(water=int(m[1]), pages=int(m[2]), glass=int(m[3]), photo=int(m[4] == "on"), outdoor=int(m[5] == "on"))
+        s["targets"] = dict(water=int(m[1]), pages=int(m[2]), glass=int(m[3]), photo=int(m[4] == "on"),
+                            outdoor=int(m[5] == "on"), screen=int(m[6] or 0))
     m = re.search(r"Progress: water (\d+) \| pages (\d+) \| photo (\S+) \| outdoor (\S+) \| mood (\S+)", text)
     if m:
         s["water"], s["pages"], s["photo_t"], s["outdoor_t"], s["mood"] = int(m[1]), int(m[2]), m[3], m[4], m[5]
-    m = re.search(r"History: (\S+) (\S+) \| Moods: (\S+)", text)
+    m = re.search(r"History: (\S+) (\S+) \| Moods: (\S+)(?: \| Emos: (\S+) \| Screens: (\S+))?", text)
     if m:
         s["hist_start"] = m[1]
         s["hist"] = "" if m[2] == "-" else m[2]
         s["moods"] = "" if m[3] == "-" else m[3]
+        s["emos"] = "" if (m[4] or "-") == "-" else m[4]
+        s["screens"] = "" if (m[5] or "-") == "-" else m[5]
+    m = re.search(r"Await: (\S+) \| (\S+) \| (\S+)", text)
+    if m:
+        s["aw_state"], s["aw_emo"], s["aw_at"] = m[1], m[2], m[3]
+    m = re.search(r"Evening: (\S+) \| screen (\S+) \| emo (\S+) \| why (.*?) \| diary (.*?) \| shot (\S+)[ \t]*$", text, re.M)
+    if m:
+        s["ev_date"], s["ev_screen"], s["ev_emo"], s["ev_why"], s["ev_diary"], s["ev_shot"] = m[1], m[2], m[3], m[4], m[5], m[6]
+    m = re.search(r"Meta: cmds (\d+)", text)
+    if m:
+        s["cmdver"] = int(m[1])
     m = re.search(r"Book: (.*?) \| Page: (.*?)\s*$", text, re.M)
     if m:
         s["book"], s["page"] = m[1], m[2]
@@ -111,11 +134,14 @@ def render(s, updated=None):
         f"Rules: wake {s['wake']} | workout video {s['workout']} | at work {s['work']} | free slips/week {s['free']} (2nd slip resets)",
         f"Times: wakecall {t['wakecall']} | midday {t['midday']} | leavecheck {t['leavecheck']} | review {t['review']}",
         f"Started: {s['started']} | Best: {s['best']} | Freezes: {s['freezes']} | Buddy: {s['buddy']} | Quiet: {s['quiet']} | Reviewed: {s['reviewed']}",
-        f"Targets: water {g['water']} | pages {g['pages']} | glass {g['glass']} | photo {onoff(g['photo'])} | outdoor {onoff(g['outdoor'])}",
+        f"Targets: water {g['water']} | pages {g['pages']} | glass {g['glass']} | photo {onoff(g['photo'])} | outdoor {onoff(g['outdoor'])} | screen {g['screen']}",
         f"Book: {s['book']} | Page: {s['page']}",
         f"Today: {s['today']} | wake {s['wake_t']} | workout {s['workout_t']} | work {s['work_t']} | left early {s['left_t']} | sent: {sent}",
         f"Progress: water {s['water']} | pages {s['pages']} | photo {s['photo_t']} | outdoor {s['outdoor_t']} | mood {s['mood']}",
-        f"History: {s['hist_start']} {s['hist'] or '-'} | Moods: {s['moods'] or '-'}",
+        f"Await: {s['aw_state']} | {s['aw_emo']} | {s['aw_at']}",
+        f"Evening: {s['ev_date']} | screen {s['ev_screen']} | emo {s['ev_emo']} | why {s['ev_why']} | diary {s['ev_diary']} | shot {s['ev_shot']}",
+        f"History: {s['hist_start']} {s['hist'] or '-'} | Moods: {s['moods'] or '-'} | Emos: {s['emos'] or '-'} | Screens: {s['screens'] or '-'}",
+        f"Meta: cmds {s['cmdver']}",
         f"Last update id: {s['last_id']}",
     ]
     for r in sorted(s["reminders"], key=lambda r: r["id"]):
@@ -125,6 +151,42 @@ def render(s, updated=None):
 
 
 # -------------------------------------------------------------------- helpers
+
+
+def parse_screen(text):
+    """Screen time in minutes from '3h20', '3h 20m', '3:20', '3.5h', '200' (minutes) or '3' (hours); None if unreadable."""
+    s = text.strip().lower().replace(",", ".")
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\s*(?:(\d+)\s*(?:m|min|mins|minutes?)?)?", s)
+    if m:
+        v = float(m[1]) * 60 + (int(m[2]) if m[2] else 0)
+    else:
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+        if m:
+            v = int(m[1]) * 60 + int(m[2])
+        else:
+            m = re.fullmatch(r"(\d+)\s*(?:m|min|mins|minutes?)", s)
+            if m:
+                v = int(m[1])
+            else:
+                m = re.fullmatch(r"(\d+(?:\.\d+)?)", s)
+                if not m:
+                    return None
+                v = float(m[1]) * 60 if float(m[1]) <= 16 else float(m[1])
+    v = int(round(v))
+    return v if 0 <= v <= 1440 else None
+
+
+def clean(t, n):
+    t = re.sub(r"\s+", " ", (t or "").replace("|", "/")).strip()[:n]
+    return t or "-"
+
+
+def nice(emo):
+    return emo.replace("_", " ")
+
+
+def stamp(now):
+    return now.strftime("%Y-%m-%dT%H:%M")
 
 
 def mins(hm):
@@ -189,8 +251,12 @@ def in_quiet(st, minute):
 # ------------------------------------------------------- history, stats, moods
 
 
-def day_set(st, d, ch=None, mood=None):
-    """Record a status char and/or a mood digit for date d (aligned strings, last HIST_KEEP days)."""
+def scr_char(minutes):
+    return SCR_CHARS[max(0, min(35, int(round(minutes / 15.0))))]
+
+
+def day_set(st, d, ch=None, mood=None, emo=None, screen=None):
+    """Record per-day values (aligned strings, last HIST_KEEP days): status, mood, emotion, screen time."""
     if d < START:
         return
     if st["hist_start"] == "-":
@@ -199,23 +265,54 @@ def day_set(st, d, ch=None, mood=None):
     i = (d - start).days
     if i < 0:
         return
-    h, mo = list(st["hist"].ljust(i + 1, ".")), list(st["moods"].ljust(i + 1, "."))
-    h, mo = h + ["."] * (len(mo) - len(h)), mo + ["."] * (len(h) - len(mo))
+    n = max([len(st[k]) for k in SEQ] + [i + 1])
+    rows = {k: list(st[k].ljust(n, ".")) for k in SEQ}
     if ch:
-        h[i] = ch
+        rows["hist"][i] = ch
     if mood:
-        mo[i] = str(mood)
-    if len(h) > HIST_KEEP:
-        cut = len(h) - HIST_KEEP
-        h, mo, start = h[cut:], mo[cut:], start + timedelta(days=cut)
-    st["hist_start"], st["hist"], st["moods"] = str(start), "".join(h), "".join(mo)
+        rows["moods"][i] = str(mood)
+    if emo:
+        rows["emos"][i] = emo
+    if screen is not None:
+        rows["screens"][i] = scr_char(screen)
+    if n > HIST_KEEP:
+        cut = n - HIST_KEEP
+        rows = {k: v[cut:] for k, v in rows.items()}
+        start = start + timedelta(days=cut)
+    st["hist_start"] = str(start)
+    for k in SEQ:
+        st[k] = "".join(rows[k])
 
 
-def hist_items(st):
+def seq_items(st, key="hist"):
     if st["hist_start"] == "-":
         return []
     start = pdate(st["hist_start"])
-    return [(start + timedelta(days=i), c) for i, c in enumerate(st["hist"])]
+    return [(start + timedelta(days=i), c) for i, c in enumerate(st[key])]
+
+
+def hist_items(st):
+    return seq_items(st, "hist")
+
+
+def fmt_min(m):
+    return f"{m // 60}h{m % 60:02d}" if m >= 60 else f"{m} min"
+
+
+def recent(st, key, today, days=7):
+    return [c for d, c in seq_items(st, key) if today - timedelta(days=days - 1) <= d <= today and c != "."]
+
+
+def screen_avg(st, today, days=7):
+    vals = [SCR_CHARS.index(c) * 15 for c in recent(st, "screens", today, days) if c in SCR_CHARS]
+    return int(sum(vals) / len(vals)) if vals else None
+
+
+def emo_summary(st, today, days=7):
+    chars = recent(st, "emos", today, days)
+    names = [CH_EMO.get(c, "other") for c in chars]
+    counts = sorted(((names.count(n), n) for n in set(names)), reverse=True)
+    return ", ".join(f"{EMO_FACE.get(n, '🙂')} {n} x{c}" for c, n in counts) or "none logged"
 
 
 EMO = {"P": "🟩", "S": "🟨", "F": "🟦", "X": "🟥", ".": "⬜"}
@@ -231,6 +328,7 @@ def heatmap(st, weeks=12):
 
 
 def stats_text(st):
+    today = datetime.now(TZ).date()
     items = [c for _, c in hist_items(st) if c != "."]
     last30 = [c for _, c in hist_items(st)][-30:]
     last30 = [c for c in last30 if c != "."]
@@ -238,10 +336,13 @@ def stats_text(st):
     pct = f"{round(100 * ok30 / len(last30))}%" if last30 else "n/a"
     moods = [int(c) for c in st["moods"][-7:] if c.isdigit()]
     mood_txt = f"{sum(moods) / len(moods):.1f}/5" if moods else "n/a"
+    sa = screen_avg(st, today)
     return (f"📊 Your stats, {NAME}\n"
             f"Day {st['day']} | Streak {st['streak']} | Best {st['best']} | Freezes {st['freezes']}/3\n"
             f"Days finished: {len(items)} | Last 30 days: {pct} on track\n"
             f"Mood (last 7 days): {mood_txt}\n"
+            f"Feelings (last 7 days): {emo_summary(st, today)}\n"
+            f"Screen time (7-day average): {fmt_min(sa) if sa is not None else 'n/a'}\n"
             f"Today: water {st['water']}/{st['targets']['water']} ml, pages {st['pages']}/{st['targets']['pages']}\n"
             f"Heatmap (🟩 perfect 🟨 slip 🟦 freeze 🟥 reset):\n{heatmap(st)}")
 
@@ -251,11 +352,14 @@ def weekly_text(st, today):
     p, s, f, x = (week.count(k) for k in "PSFX")
     moods = [int(c) for c in st["moods"][-7:] if c.isdigit()]
     mood_txt = f"{sum(moods) / len(moods):.1f}/5" if moods else "n/a"
+    sa = screen_avg(st, today)
     return (f"🗓️ Weekly review, {NAME}\n"
             f"Perfect days: {p} | Slips: {s} | Freezes used: {f} | Resets: {x}\n"
             f"Streak {st['streak']} (best {st['best']}) | Mood avg {mood_txt}\n"
+            f"Feelings: {emo_summary(st, today)}\n"
+            f"Screen time (average): {fmt_min(sa) if sa is not None else 'n/a'}\n"
             f"Heatmap:\n{heatmap(st, 6)}\n"
-            f"Reflect: what worked this week? Reply with journal: <one line>")
+            f"Reflect: what worked this week? Reply with /diary <one line>")
 
 
 # ---------------------------------------------------------------- reminders
@@ -419,9 +523,15 @@ def is_once(rule):
 
 L_AWAKE, L_VIDEO, L_WORK, L_LEAVE = "☀️ I'm awake", "🎥 Workout video", "📍 I'm at work", "🚪 Leaving work"
 L_OUTDOOR, L_PHOTO, L_FOCUS, L_MOOD = "🌳 Outdoor workout", "📸 Progress photo", "🍅 Focus 25", "😊 Mood"
-L_STATS, L_REM, L_HELP = "📊 Stats", "⏰ Reminders", "❓ Help"
+L_STATS, L_REM, L_HELP, L_WD = "📊 Stats", "⏰ Reminders", "❓ Help", "🌙 Wind-down"
 LABELS = {L_AWAKE: "awake", L_VIDEO: "hint_video", L_WORK: "atwork", L_LEAVE: "leave", L_OUTDOOR: "outdoor",
-          L_PHOTO: "hint_photo", L_FOCUS: "focus", L_MOOD: "mood", L_STATS: "stats", L_REM: "rlist", L_HELP: "help"}
+          L_PHOTO: "hint_photo", L_FOCUS: "focus", L_MOOD: "mood", L_STATS: "stats", L_REM: "rlist", L_HELP: "help", L_WD: "wd"}
+SLASH = {"/start": "start", "/status": "status", "/help": "help", "/stats": "stats", "/menu": "menu", "/wd": "wd",
+         "/cancel": "cancel", "/feel": "feel", "/feelings": "feelings", "/export": "export", "/awake": "awake",
+         "/atwork": "atwork", "/leaving": "leave", "/leave": "leave", "/outdoor": "outdoor", "/photo": "hint_photo",
+         "/video": "hint_video", "/reminders": "rlist"}
+EXPLICIT = {"start", "status", "help", "stats", "menu", "wd", "cancel", "feel", "feelings", "export", "rlist", "rremove",
+            "rclear", "redit", "remind", "setrule", "quiet", "buddy", "screen", "diary_show"}
 RE_WATER_BTN = re.compile(r"^💧 \+(\d+) ?ml$")
 RE_PAGES_BTN = re.compile(r"^📖 \+(\d+) pages?$")
 
@@ -433,10 +543,11 @@ RE_PAGE = re.compile(r"\bpage\s*(\d+)\b|\bp\.?\s*(\d+)\b", re.I)
 RE_READ = re.compile(r"^/?(?:read|pages?)\s+(\d+)\s*(?:pages?)?\s*$", re.I)
 RE_WATER = re.compile(r"^/?(?:water|drank|drink)\s*([+-]?\d+(?:\.\d+)?)\s*(ml|l|litres?|liters?|glass(?:es)?)?\s*$", re.I)
 RE_SET = re.compile(
-    r"^/?set\s+(wake|workout|work|wakecall|midday|leavecheck|leave|review|water|pages|glass|photo|outdoor)\s*(?:to|at)?\s*(.+)$", re.I)
+    r"^/?set\s+(wake|workout|work|wakecall|midday|leavecheck|leave|review|water|pages|glass|photo|outdoor|screen)\s*(?:to|at)?\s*(.+)$", re.I)
 RE_FOCUS = re.compile(r"^/?focus\b(?:\s+(\d{1,3}))?\s*(.*)$", re.I)
 RE_MOOD = re.compile(r"^/?mood\b(?:\s+([1-5]))?\s*$", re.I)
-RE_JOURNAL = re.compile(r"^/?journal\b\s*:?\s*(.+)$", re.I | re.S)
+RE_DIARY = re.compile(r"^/?(?:diary|journal)\b\s*:?\s*(.*)$", re.I | re.S)
+RE_SCREEN = re.compile(r"^/?screen\b\s*(?:time|today|usage)?\s*(.*)$", re.I)
 RE_QUIET = re.compile(r"^/?quiet\b\s*(?:hours)?\s*(.+)$", re.I)
 RE_BUDDY = re.compile(r"^/?buddy\s+(\S+)\s*$", re.I)
 RE_RLIST = re.compile(r"^/?(?:reminders|list reminders|my reminders|show reminders)\s*$", re.I)
@@ -463,14 +574,16 @@ def classify(m):
         return ("outdoor" if RE_OUTDOOR.search(caption) else "workout"), None
     if "photo" in m or mime.startswith("image"):
         return "photo", None
-    text = (m.get("text") or caption).strip()
+    text = re.sub(r"^(/\w+)@\w+", r"\1", (m.get("text") or caption).strip())
     low = text.lower()
-    if low == "/start":
-        return "start", None
-    if low in ("/status", "status"):
-        return "status", None
-    if low in ("/help", "help"):
-        return "help", None
+    if low in SLASH:
+        return SLASH[low], None
+    if low == "/water":
+        return "water", (1.0, "glass")
+    if low == "/pages":
+        return "pages", 5
+    if low in ("status", "help"):
+        return low, None
     if text in LABELS:
         return LABELS[text], None
     r = RE_WATER_BTN.match(text)
@@ -509,9 +622,17 @@ def classify(m):
     r = RE_MOOD.match(text)
     if r:
         return "mood", (int(r[1]) if r[1] else None)
-    r = RE_JOURNAL.match(text)
+    r = RE_DIARY.match(text)
     if r:
-        return "journal", r[1].strip()
+        arg = r[1].strip()
+        if not arg:
+            return "diary_show", None
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg):
+            return "diary_show", arg
+        return "journal", arg
+    r = RE_SCREEN.match(text)
+    if r:
+        return "screen", r[1].strip()
     r = RE_QUIET.match(text)
     if r:
         return "quiet", r[1].strip()
@@ -605,34 +726,37 @@ def wake_call(st):
 
 
 def welcome_text(st, today):
-    when = "Day 1 starts tomorrow at 5:00." if today < START else "You're on the clock. Let's go."
+    when = "Day 1 starts on " + START.strftime("%d %B") + "." if today < START else "You're on the clock. Let's go."
     return (f"👋 Welcome, {NAME}! Your Daily Compass is on.\n{when}\n\n"
             "How it works:\n"
-            "• The buttons below change with your day. Tap the one that applies.\n"
+            "• Type / to see every command, or send /menu for tap buttons.\n"
             "• 🎥 videos count as your workout, 📸 photos as your progress photo.\n"
+            "• /wd starts your evening wind-down: screen time, how you feel and why, and your diary.\n"
             "• Add reminders by typing, for example: remind daily 7am drink water\n"
             "• Send /help any time for everything I understand.")
 
 
 def help_text():
     return (
-        f"Here's what I understand, {NAME}:\n"
-        "BUTTONS: tap the keyboard below.\n"
-        "CHECK-INS\n• \"I'm awake\", a 🎥 video, \"I'm at work\", \"leaving early\"\n"
-        "• a 🌳 video with 'outdoor' in the caption, or the 🌳 button\n• a 📸 photo = progress photo\n"
-        "TASKS\n• water 500 (or water -250, water 1 l)\n• read 10 pages, or read to page 80\n"
+        f"Here's what I understand, {NAME}. Type / to see the command menu; /menu shows tap buttons.\n"
+        "CHECK-INS\n• /awake or \"I'm awake\" • a 🎥 video • /atwork • /leaving\n"
+        "• /outdoor, or a video with 'outdoor' in the caption • a 📸 photo = progress photo\n"
+        "TASKS\n• /water 500 (or water -250, water 1 l) • /pages 10 or read to page 80\n"
         "• book: <title>, page <n>\n"
-        "REMINDERS\n• remind 15:00 call mum\n• remind daily 7am drink water\n• remind weekdays 08:00 stand-up\n"
-        "• remind every mon,wed 18:00 gym\n• reminders | remove 2 | change 2 to 4:30pm | clear reminders\n"
-        "• quiet 22:30-05:00 (reminders wait until morning) | quiet off\n"
-        "FOCUS, MOOD, JOURNAL\n• focus 25 (timer) | mood 4 | journal: <one line>\n"
-        "STATS\n• /stats | /status | buddy <chat id> (weekly summary to a friend) | buddy off\n"
+        "EVENING\n• /wd wind-down: screen time, feelings + why, diary • screen 3h20 • /feel (quick check-in)\n"
+        "• /diary (read today) | /diary 2026-11-05 | /diary <write an entry> • /feelings • /export (diary file)\n"
+        "• /cancel stops a question I'm waiting on\n"
+        "REMINDERS\n• remind 15:00 call mum • remind daily 7am drink water • remind in 10 minutes stretch\n"
+        "• remind every mon,wed 18:00 gym • reminders | remove 2 | change 2 to 4:30pm | clear reminders\n"
+        "• quiet 22:30-05:00 | quiet off\n"
+        "FOCUS, MOOD\n• focus 25 | mood 4\n"
+        "STATS\n• /stats | /status | buddy <chat id> | buddy off\n"
         "SETTINGS\n• set wake 05:45 (also workout, work, wakecall, midday, leavecheck, review; add off to disable)\n"
-        "• set water 3000 | set pages 10 | set glass 250 | set photo off | set outdoor off"
+        "• set water 3000 | set pages 10 | set glass 250 | set photo off | set outdoor off | set screen 3h (daily limit) | set screen off"
     )
 
 
-def status_text(st):
+def status_text(st):  # noqa
     g = st["targets"]
     return (f"Day {st['day']} | Streak {st['streak']} (best {st['best']}) | Slips this week {st['slips']}/{st['free']} free | Freezes {st['freezes']}\n"
             f"Today: wake {st['wake_t']}, workout {st['workout_t']}, work {st['work_t']}\n"
@@ -648,6 +772,15 @@ def apply_setrule(st, key, val):
     low = val.lower().strip()
     off = low in ("off", "none", "stop", "disable", "no")
     on = low in ("on", "yes", "enable")
+    if key == "screen":
+        if off:
+            st["targets"]["screen"] = 0
+            return "Done. The screen-time limit is off."
+        v = parse_screen(val)
+        if not v:
+            return "Try: set screen 3h (a daily limit), or set screen off"
+        st["targets"]["screen"] = v
+        return f"Done. Your daily screen-time limit is {fmt_min(v)}. Log it in /wd or with: screen 3h20. Going over, or not logging it, counts as a miss."
     if key in ("water", "pages", "glass"):
         n = re.search(r"\d+(?:\.\d+)?", low)
         if off and key != "glass":
@@ -683,8 +816,8 @@ def apply_setrule(st, key, val):
 
 
 def keyboard_for(st):
+    """Tap buttons, shown only when you send /menu (they hide again after one tap)."""
     g = st["targets"]
-    rows = []
     r1 = []
     if st["wake_t"] == "-":
         r1.append(L_AWAKE)
@@ -707,10 +840,16 @@ def keyboard_for(st):
     r3.append(L_FOCUS)
     if st["mood"] == "-":
         r3.append(L_MOOD)
-    for r in (r1, r2, r3, [L_STATS, L_REM, L_HELP]):
-        if r:
-            rows.append([{"text": b} for b in r])
-    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
+    rows = [[{"text": b} for b in r] for r in (r1, r2, r3, [L_WD, L_STATS, L_REM, L_HELP]) if r]
+    return {"keyboard": rows, "resize_keyboard": True, "one_time_keyboard": True}
+
+
+REMOVE_KB = {"remove_keyboard": True}
+
+
+def emotion_buttons():
+    row = lambda items: [{"text": f"{f} {n}", "callback_data": f"emo:{n}"} for n, f in items]
+    return {"inline_keyboard": [row(EMOTIONS[:3]), row(EMOTIONS[3:])]}
 
 
 def reminder_buttons():
@@ -723,9 +862,15 @@ def mood_buttons():
     return {"inline_keyboard": [[{"text": f"{faces[i]} {i + 1}", "callback_data": f"mood:{i + 1}"} for i in range(5)]]}
 
 
-BOT_COMMANDS = [("start", "Start the Compass"), ("status", "Today at a glance"), ("stats", "Streak, heatmap, mood"),
-                ("reminders", "List your reminders"), ("water", "Log water, e.g. /water 500"),
-                ("focus", "Focus timer, e.g. /focus 25"), ("mood", "Rate your mood"), ("help", "Everything I understand")]
+BOT_COMMANDS = [("wd", "Evening wind-down: screen time, feelings, diary"), ("awake", "Log that you're up"),
+                ("atwork", "Log arriving at work"), ("leaving", "Log leaving work"), ("water", "Log water, e.g. /water 500"),
+                ("pages", "Log reading, e.g. /pages 10"), ("outdoor", "Log your outdoor workout"),
+                ("photo", "Send your progress photo"), ("video", "Log your workout video"),
+                ("focus", "Focus timer, e.g. /focus 25"), ("feel", "Quick feelings check-in"), ("mood", "Rate your mood"),
+                ("diary", "Read or write your diary"), ("feelings", "Your feelings log"), ("export", "Send me my diary file"),
+                ("stats", "Streak, heatmap, trends"), ("status", "Today at a glance"), ("reminders", "Your reminders"),
+                ("menu", "Show tap buttons"), ("cancel", "Cancel what I'm asking"), ("help", "Everything I understand"),
+                ("start", "Start the Compass")]
 
 
 # ----------------------------------------------------------------- day closing
@@ -752,6 +897,11 @@ def close_day(st, d, test_note=False):
         misses.append("outdoor workout missing")
     if g["photo"] and st["photo_t"] == "-":
         misses.append("progress photo missing")
+    if g["screen"]:
+        if st["ev_date"] != str(d) or st["ev_screen"] == "-":
+            misses.append("screen time not logged")
+        elif int(st["ev_screen"]) > g["screen"]:
+            misses.append(f"screen time {fmt_min(int(st['ev_screen']))} (limit {fmt_min(g['screen'])})")
     if not misses:
         st["streak"] += 1
         st["best"] = max(st["best"], st["streak"])
@@ -817,6 +967,113 @@ def run(st, updates, now):
         if st["page"].isdigit():
             st["page"] = str(int(st["page"]) + n)
 
+    def ev_touch():
+        if st["ev_date"] != str(today):
+            st.update(ev_date=str(today), ev_screen="-", ev_emo="-", ev_why="-", ev_diary="-", ev_shot="-")
+
+    def log_diary(kind, text):
+        out.append({"k": "diary_add", "ts": now.strftime("%Y-%m-%d %H:%M"), "kind": kind,
+                    "text": re.sub(r"\s+", " ", text).strip()})
+
+    def clear_await():
+        st["aw_state"], st["aw_emo"], st["aw_at"] = "-", "-", "-"
+
+    def set_screen(minutes):
+        ev_touch()
+        st["ev_screen"] = str(minutes)
+        day_set(st, today, screen=minutes)
+        log_diary("screen", f"{minutes} min ({fmt_min(minutes)})")
+
+    def ask_emotion():
+        st["aw_state"], st["aw_at"] = "wd_emotion", stamp(now)
+        out.append(msg("2) How are you feeling tonight? Tap one, or type your own word.", emotion_buttons()))
+
+    def ask_why(emo, solo):
+        st["aw_state"], st["aw_emo"], st["aw_at"] = ("feel_why" if solo else "wd_why"), emo, stamp(now)
+        out.append(f"What's behind feeling {nice(emo)}? A few words is enough (or type skip).")
+
+    def ask_diary():
+        st["aw_state"], st["aw_at"] = "wd_diary", stamp(now)
+        out.append("3) Anything else on your mind? Write it as tonight's diary entry, or type done.")
+
+    def record_emotion(emo):
+        ev_touch()
+        emo = clean(emo.lower(), 14).replace(" ", "_")
+        st["ev_emo"] = emo
+        day_set(st, today, emo=EMO_CH.get(emo, "o"))
+        log_diary("feeling", nice(emo))
+        return emo
+
+    def finish_wd():
+        clear_await()
+        parts = ["🌙 Saved for tonight:"]
+        if st["ev_screen"] != "-":
+            line = f"• Screen time: {fmt_min(int(st['ev_screen']))}"
+            if st["targets"]["screen"]:
+                line += f" (limit {fmt_min(st['targets']['screen'])})"
+            parts.append(line)
+        if st["ev_emo"] != "-":
+            parts.append(f"• Feeling: {EMO_FACE.get(st['ev_emo'], '🙂')} {nice(st['ev_emo'])}" + (f", because {st['ev_why']}" if st["ev_why"] != "-" else ""))
+        if st["ev_diary"] != "-":
+            parts.append("• Diary entry ✓")
+        if len(parts) == 1:
+            parts.append("• (nothing logged)")
+        if cur <= mins(REFLECT_AT):
+            parts.append(f"Your reflection arrives around {REFLECT_AT}. Everything is also in /diary.")
+        else:
+            parts.append(f"It's after {REFLECT_AT}, so tonight's reflection has passed. It's all saved in /diary.")
+        parts.append(f"Sleep well, {NAME}. 🌙")
+        out.append("\n".join(parts))
+
+    def handle_await(text):
+        s = st["aw_state"]
+        low = text.strip().lower()
+        skip = low in ("skip", "no", "none", "-", "pass", "nothing")
+        if s == "wd_screen":
+            if skip:
+                ask_emotion()
+                return
+            v = parse_screen(text)
+            if v is None:
+                out.append("I couldn't read that. Type it like 3h20, 3.5h or 200 (minutes), or type skip.")
+                return
+            set_screen(v)
+            lim = st["targets"]["screen"]
+            out.append(f"📱 {fmt_min(v)}" + (f" ({'over' if v > lim else 'within'} your {fmt_min(lim)} limit)." if lim else " saved."))
+            ask_emotion()
+        elif s == "wd_emotion":
+            if skip:
+                ask_diary()
+                return
+            emo = record_emotion(text)
+            ask_why(emo, False)
+        elif s in ("wd_why", "feel_why"):
+            emo = st["aw_emo"]
+            if not skip:
+                ev_touch()
+                st["ev_why"] = clean(text, 120)
+                log_diary("why", f"{nice(emo)}: {text}")
+            if s == "feel_why":
+                clear_await()
+                out.append("Saved. I'll remember it for your diary and reflection. 🧡")
+            else:
+                ask_diary()
+        elif s == "wd_diary":
+            if low in ("done", "skip", "no", "none", "that's all", "thats all", "nothing"):
+                finish_wd()
+            else:
+                ev_touch()
+                st["ev_diary"] = clean(text, 250)
+                log_diary("diary", text)
+                finish_wd()
+
+    if st["aw_state"] != "-":
+        try:
+            if now - datetime.strptime(st["aw_at"], "%Y-%m-%dT%H:%M").replace(tzinfo=TZ) > timedelta(hours=AWAIT_HOURS):
+                clear_await()
+        except ValueError:
+            clear_await()
+
     for u in updates:
         if "callback_query" in u:
             cq = u["callback_query"]
@@ -833,6 +1090,11 @@ def run(st, updates, now):
                 add_reminder(st, t_, rule, text)
                 out.append({"k": "answer", "id": cq["id"], "text": f"Snoozed {mins_ahead} min 💤"})
                 out.append({"k": "edit", "message_id": mid, "text": f"💤 Snoozed until {t_}: {body}"})
+            elif data.startswith("emo:"):
+                emo = record_emotion(data.split(":", 1)[1])
+                out.append({"k": "answer", "id": cq["id"], "text": f"{nice(emo)} noted"})
+                out.append({"k": "edit", "message_id": mid, "text": f"Feeling: {EMO_FACE.get(emo, '🙂')} {nice(emo)}"})
+                ask_why(emo, st["aw_state"] != "wd_emotion")
             elif data.startswith("mood:"):
                 n = int(data.split(":")[1])
                 st["mood"] = str(n)
@@ -857,6 +1119,12 @@ def run(st, updates, now):
             out.append(msg("👋 Tap /start to begin."))
             continue
         g = st["targets"]
+        text0 = re.sub(r"^(/\w+)@\w+", r"\1", (m.get("text") or m.get("caption") or "").strip())
+        is_cmd = text0.startswith("/") or text0 in LABELS or RE_WATER_BTN.match(text0) or RE_PAGES_BTN.match(text0)
+        if (st["aw_state"] != "-" and text0 and kind not in EXPLICIT
+                and kind not in ("workout", "outdoor", "photo") and not is_cmd):
+            handle_await(text0)
+            continue
         if kind == "awake":
             if st["wake_t"] == "-":
                 st["wake_t"] = t
@@ -876,6 +1144,11 @@ def run(st, updates, now):
                 out.append(f"🌳 Outdoor workout logged at {t}. Great, {NAME}.")
             else:
                 out.append(f"Outdoor workout already logged at {st['outdoor_t']}. 👍")
+        elif kind == "photo" and st["aw_state"].startswith("wd_"):
+            ev_touch()
+            ph = m.get("photo") or []
+            st["ev_shot"] = clean((ph[-1].get("file_id") if ph else (m.get("document") or {}).get("file_id")) or "x", 120)
+            out.append("Screenshot saved 📱." + (" Now type the total, like 3h20 (or type skip)." if st["aw_state"] == "wd_screen" else ""))
         elif kind == "photo":
             if st["photo_t"] == "-":
                 st["photo_t"] = t
@@ -931,7 +1204,41 @@ def run(st, updates, now):
             else:
                 out.append(msg("How are you feeling today?", mood_buttons()))
         elif kind == "journal":
-            out.append("📝 Saved to your journal. It lives in this chat, so search \"journal\" to find your entries.")
+            ev_touch()
+            st["ev_diary"] = clean(data, 250)
+            log_diary("diary", data)
+            out.append("📝 Saved to your diary. /diary shows today's entries, /export sends the whole file.")
+        elif kind == "wd":
+            ev_touch()
+            st["aw_state"], st["aw_emo"], st["aw_at"] = "wd_screen", "-", stamp(now)
+            lim = g["screen"]
+            out.append(f"🌙 Wind-down, {NAME}. Let's close the day gently.\n"
+                       "1) Screen time today: type the total, like 3h20, 3.5h or 200 (minutes)."
+                       + (f" Your limit is {fmt_min(lim)}." if lim else "")
+                       + "\nYou can send the screenshot first if you like, or type skip. (/cancel stops anything.)")
+        elif kind == "screen":
+            v = parse_screen(data) if data else None
+            if v is None:
+                out.append("Type it like: screen 3h20, screen 3.5h or screen 200 (minutes).")
+            else:
+                set_screen(v)
+                lim = g["screen"]
+                out.append(f"📱 Screen time saved: {fmt_min(v)}" + (f" ({'over' if v > lim else 'within'} your {fmt_min(lim)} limit)." if lim else "."))
+                if st["aw_state"] == "wd_screen":
+                    ask_emotion()
+        elif kind == "feel":
+            out.append(msg("How are you feeling right now?", emotion_buttons()))
+        elif kind == "cancel":
+            clear_await()
+            out.append("Okay, cancelled.")
+        elif kind == "menu":
+            out.append(msg("Tap one 👇 (the buttons hide after you tap).", keyboard_for(st)))
+        elif kind == "diary_show":
+            out.append({"k": "diary_show", "date": data or str(today)})
+        elif kind == "feelings":
+            out.append({"k": "feelings"})
+        elif kind == "export":
+            out.append({"k": "export"})
         elif kind == "quiet":
             low = data.lower()
             if low in ("off", "none", "no"):
@@ -1011,6 +1318,12 @@ def run(st, updates, now):
             out.append(msg(f"👋 Good morning, {NAME}! Tap /start to switch your Compass on for today."))
             st["sent"].append("startnudge")
         return st, out, voice
+
+    if st["cmdver"] != CMDVER:
+        st["cmdver"] = CMDVER
+        out.append({"k": "commands"})
+        out.append("🆕 Updated! Type / to see every command. /menu shows tap buttons (they only appear when you ask). "
+                   "/wd starts your evening wind-down: screen time, feelings and why, and your diary.")
 
     # custom reminders (work every day, including test days). Quiet hours defer them to the morning.
     keep = []
@@ -1120,6 +1433,27 @@ class Telegram:
         pm = (r.get("result") or {}).get("pinned_message")
         return (pm["message_id"], pm["text"]) if pm else (None, None)
 
+    def send_document(self, path, caption=""):
+        if self.dry:
+            print(f"[DRY sendDocument] {path}")
+            return {"ok": True}
+        import uuid
+        boundary = uuid.uuid4().hex
+        with open(path, "rb") as f:
+            data = f.read()
+        head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{self.chat}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{os.path.basename(path)}\"\r\n"
+                "Content-Type: text/plain\r\n\r\n").encode("utf-8")
+        body = head + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        req = urllib.request.Request(f"https://api.telegram.org/bot{self.token}/sendDocument", data=body,
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(req, timeout=40) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            return json.loads(e.read().decode() or "{}")
+
     def send(self, text, markup=None, chat=None):
         p = dict(chat_id=chat or self.chat, text=text[:4000])
         if markup:
@@ -1138,13 +1472,51 @@ def load_env_file(path="compass.env"):
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+DIARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diary.txt")
+
+
+def diary_lines():
+    try:
+        return open(DIARY, encoding="utf-8").read().splitlines()
+    except OSError:
+        return []
+
+
+def send_long(tg, text, markup=None):
+    while text:
+        chunk, text = text[:3800], text[3800:]
+        tg.send(chunk, markup)
+
+
 def deliver(tg, chat, st, out):
-    kb = keyboard_for(st)
     for item in out:
         if isinstance(item, str):
-            tg.send(item, kb)
+            tg.send(item, REMOVE_KB)
         elif item["k"] == "msg":
-            tg.send(item["text"], item["markup"] or kb)
+            tg.send(item["text"], item["markup"] or REMOVE_KB)
+        elif item["k"] == "diary_add":
+            try:
+                with open(DIARY, "a", encoding="utf-8") as f:
+                    f.write(f"[{item['ts']}] {item['kind']}: {item['text']}\n")
+            except OSError:
+                pass
+        elif item["k"] == "diary_show":
+            lines, d = diary_lines(), item["date"]
+            sel = [x for x in lines if x.startswith(f"[{d}")]
+            if sel:
+                send_long(tg, f"📓 Your diary for {d}:\n" + "\n".join(sel), REMOVE_KB)
+            elif lines:
+                send_long(tg, f"📓 Nothing for {d} yet. Your latest entries:\n" + "\n".join(lines[-12:]), REMOVE_KB)
+            else:
+                tg.send("📓 Your diary is empty. Run /wd, or write one with: /diary <text>", REMOVE_KB)
+        elif item["k"] == "feelings":
+            sel = [x for x in diary_lines() if "] feeling:" in x or "] why:" in x][-24:]
+            send_long(tg, ("🧡 Your feelings log:\n" + "\n".join(sel)) if sel else "🧡 No feelings logged yet. Try /feel or /wd.", REMOVE_KB)
+        elif item["k"] == "export":
+            if diary_lines():
+                tg.send_document(DIARY, "📓 Your diary")
+            else:
+                tg.send("📓 Your diary is empty, so there's nothing to export yet.", REMOVE_KB)
         elif item["k"] == "edit":
             tg.call("editMessageText", chat_id=chat, message_id=item["message_id"], text=item["text"],
                     reply_markup=json.dumps({"inline_keyboard": []}))
@@ -1160,7 +1532,10 @@ BACKUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_backu
 
 
 def fit(st, text):
-    """Telegram messages hold 4096 characters: drop the oldest history days if the tracker grows too long."""
+    """Telegram messages hold 4096 characters: shorten diary snippets, then drop the oldest history days."""
+    if len(text) > 4000:
+        st["ev_diary"], st["ev_why"] = clean(st["ev_diary"], 60), clean(st["ev_why"], 60)
+        text = render(st, updated=st["updated"])
     while len(text) > 4000 and len(st["hist"]) > 14:
         date_cut(st)
         text = render(st, updated=st["updated"])
@@ -1169,7 +1544,8 @@ def fit(st, text):
 
 def date_cut(st):
     cut = 10
-    st["hist"], st["moods"] = st["hist"][cut:], st["moods"][cut:]
+    for k in SEQ:
+        st[k] = st[k][cut:]
     st["hist_start"] = str(pdate(st["hist_start"]) + timedelta(days=cut))
     return cut
 
@@ -1313,7 +1689,7 @@ def main():
         # Safe test mode: play a fake morning at TEST_TIME on Day 1. Never edits the tracker.
         _, old_text = tg.tracker()
         st = parse(old_text) if old_text else new_state()
-        st["reminders"], st["started"] = [], "test"
+        st["reminders"], st["started"], st["cmdver"] = [], "test", CMDVER
         h, m = test_time.split(":")
         now = datetime(START.year, START.month, START.day, int(h), int(m), tzinfo=TZ)
         st.update(day=1, today=str(START), wake_t="-", workout_t="-", work_t="-", left_t="-", sent=[], reviewed="-")
