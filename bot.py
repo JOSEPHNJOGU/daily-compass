@@ -31,7 +31,7 @@ MAX_REMINDERS = 20
 HIST_KEEP = 90                     # days of history kept in the tracker
 DEFAULT_TIMES = dict(wakecall="05:00", midday="12:30", leavecheck="17:30", review="21:00", winddown="22:00")
 DEFAULT_TARGETS = dict(water=3000, pages=10, glass=500, photo=1, outdoor=1, screen=0, music=1)
-CMDVER = 4                         # bump to re-register the "/" command menu
+CMDVER = 5                         # bump to re-register the "/" command menu
 REFLECT_AT = "23:20"               # last hourly slot of the evening Claude reflection
 WAKE_DEADLINE_AFTER = 30           # minutes after the wake-up call: "I'm awake" deadline
 WORKOUT_DEADLINE_AFTER = 90        # minutes after the wake-up call: workout video deadline
@@ -48,6 +48,16 @@ CH_EMO = {v: k for k, v in EMO_CH.items()}
 EMO_FACE = dict(EMOTIONS)
 SEQ = ("hist", "moods", "emos", "screens")
 SCR_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
+B36 = SCR_CHARS
+SLEEP_KEEP = 60                    # days of sleep history kept in the tracker
+SLEEP_GOAL = 480                   # default sleep goal in minutes (8 hours)
+NIGHT_CUTOFF = 300                 # an "awake" before 05:00 is a night wake, not the morning
+LATE_AWAKE_AFTER = 120             # awake logged this many minutes after the wake-up call: ask the real time
+MAX_SESSION = 16 * 60              # a sleep session open longer than this was never closed
+LONG_SLEEP = 14 * 60               # a night this long is suspicious: ask for the real wake-up time
+MIN_SLEEP, MIN_NAP = 10, 5         # shorter sessions (minutes) are not counted
+SHORT_NIGHT = 90                   # a "night" under this many minutes is counted as a nap
+CONFIRM_MINUTES = 30               # a time confirmation expires after this long
 
 DEFAULT = dict(
     day=0, streak=0, slips=0, week="2026-11-02",
@@ -60,6 +70,9 @@ DEFAULT = dict(
     hist_start="-", hist="", moods="", emos="", screens="",
     aw_state="-", aw_emo="-", aw_at="-",
     ev_date="-", ev_screen="-", ev_emo="-", ev_why="-", ev_diary="-", ev_shot="-", ev_done="-", cmdver=0, next_wake="-",
+    sl_state="-", sl_since="-", sl_gaps=0, sl_gapat="-", sl_goal=SLEEP_GOAL, sl_last="-",
+    sl_start="-", sl_nights="", sl_naps="",
+    cf_kind="-", cf_stage="-", cf_at="-", cf_data="-",
 )
 
 
@@ -111,6 +124,17 @@ def parse(text):
     m = re.search(r"Next: wake (\S+)", text)
     if m:
         s["next_wake"] = m[1]
+    m = re.search(r"Rest: (\S+) \| since (\S+) \| gaps (\d+) \| gapat (\S+) \| goal (\d+) \| last (\S+)", text)
+    if m:
+        s["sl_state"], s["sl_since"], s["sl_gaps"], s["sl_gapat"], s["sl_goal"], s["sl_last"] = m[1], m[2], int(m[3]), m[4], int(m[5]), m[6]
+    m = re.search(r"SleepLog: (\S+) (\S+) \| naps (\S+)", text)
+    if m:
+        s["sl_start"] = m[1]
+        s["sl_nights"] = "" if m[2] == "-" else m[2]
+        s["sl_naps"] = "" if m[3] == "-" else m[3]
+    m = re.search(r"^Confirm: (\S+) \| (\S+) \| (\S+) \| (.*?)\s*$", text, re.M)
+    if m:
+        s["cf_kind"], s["cf_stage"], s["cf_at"], s["cf_data"] = m[1], m[2], m[3], m[4]
     m = re.search(r"Meta: cmds (\d+)", text)
     if m:
         s["cmdver"] = int(m[1])
@@ -153,6 +177,9 @@ def render(s, updated=None):
         f"Await: {s['aw_state']} | {s['aw_emo']} | {s['aw_at']}",
         f"Evening: {s['ev_date']} | screen {s['ev_screen']} | emo {s['ev_emo']} | why {s['ev_why']} | diary {s['ev_diary']} | shot {s['ev_shot']} | done {s['ev_done']}",
         f"Next: wake {s['next_wake']}",
+        f"Rest: {s['sl_state']} | since {s['sl_since']} | gaps {s['sl_gaps']} | gapat {s['sl_gapat']} | goal {s['sl_goal']} | last {s['sl_last']}",
+        f"SleepLog: {s['sl_start']} {s['sl_nights'] or '-'} | naps {s['sl_naps'] or '-'}",
+        f"Confirm: {s['cf_kind']} | {s['cf_stage']} | {s['cf_at']} | {s['cf_data']}",
         f"History: {s['hist_start']} {s['hist'] or '-'} | Moods: {s['moods'] or '-'} | Emos: {s['emos'] or '-'} | Screens: {s['screens'] or '-'}",
         f"Meta: cmds {s['cmdver']}",
         f"Last update id: {s['last_id']}",
@@ -387,6 +414,7 @@ def stats_text(st):
             f"Mood (last 7 days): {mood_txt}\n"
             f"Feelings (last 7 days): {emo_summary(st, today)}\n"
             f"Screen time (7-day average): {fmt_min(sa) if sa is not None else 'n/a'}\n"
+            f"Sleep (7-day average): {sleep_avg_text(st, today) or 'n/a'} (/sleepstats for more)\n"
             f"Today: water {st['water']}/{st['targets']['water']} ml, pages {st['pages']}/{st['targets']['pages']}\n"
             f"Heatmap (🟩 perfect 🟨 slip 🟦 freeze 🟥 reset):\n{heatmap(st)}")
 
@@ -402,8 +430,327 @@ def weekly_text(st, today):
             f"Streak {st['streak']} (best {st['best']}) | Mood avg {mood_txt}\n"
             f"Feelings: {emo_summary(st, today)}\n"
             f"Screen time (average): {fmt_min(sa) if sa is not None else 'n/a'}\n"
+            f"Sleep (average): {sleep_avg_text(st, today) or 'n/a'}\n"
             f"Heatmap:\n{heatmap(st, 6)}\n"
             f"Reflect: what worked this week? Reply with /diary <one line>")
+
+
+# ------------------------------------------------- times, sleep and feelings
+
+RE_CLOCK = re.compile(r"^(?:at\s+|around\s+|by\s+|about\s+|@\s*)?(\d{1,2})(?:[:.](\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?$", re.I)
+TIME_KEYS = ("wake", "workout", "work", "wakecall", "midday", "leavecheck", "leave", "review", "winddown")
+
+
+def parse_clock(frag):
+    """Read a clock time. Returns 'HH:MM' when it is certain (am/pm given, 13-23, 00, or a leading zero like 07:30),
+    'h:mm?' when it could be AM or PM, or None when it is not a time."""
+    s = (frag or "").strip().lower().rstrip(".,!?")
+    if s in ("noon", "midday"):
+        return "12:00"
+    if s == "midnight":
+        return "00:00"
+    m = RE_CLOCK.match(s)
+    if not m:
+        return None
+    raw_h, mi, ap = m[1], int(m[2] or 0), (m[3] or "").replace(".", "")
+    h = int(raw_h)
+    if mi > 59:
+        return None
+    if ap:
+        if not 1 <= h <= 12:
+            return None
+        return f"{(0 if h == 12 else h) + (12 if ap.startswith('p') else 0):02d}:{mi:02d}"
+    if h > 23:
+        return None
+    if h == 0 or h >= 13 or raw_h.startswith("0"):
+        return f"{h:02d}:{mi:02d}"
+    return f"{h}:{mi:02d}?"
+
+
+def resolve_slot(slot, ap):
+    """Turn an ambiguous 'h:mm?' into 'HH:MM' using 'am' or 'pm'."""
+    h, mi = slot.rstrip("?").split(":")
+    return f"{int(h) % 12 + (12 if ap == 'pm' else 0):02d}:{mi}"
+
+
+def pretty(hm):
+    """'19:30' -> '19:30 (7:30 PM)' so a wrong guess is easy to spot."""
+    h, mi = [int(x) for x in hm.split(":")]
+    return f"{hm} ({h % 12 or 12}:{mi:02d} {'AM' if h < 12 else 'PM'})"
+
+
+def plain12(hm):
+    h, mi = [int(x) for x in hm.split(":")]
+    return f"{h % 12 or 12}:{mi:02d} {'AM' if h < 12 else 'PM'}"
+
+
+RE_REM_TIME = re.compile(
+    r"(?:\bat\s+)?\b\d{1,2}[:.]\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?(?![\w:])"
+    r"|(?:\bat\s+)?\b\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?)(?![\w])"
+    r"|\bat\s+\d{1,2}\b(?![:.]\d)(?!\s*(?:min|mins|minutes?|hours?|hrs?|h)\b)", re.I)
+
+
+def pstamp(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
+    except (ValueError, TypeError):
+        return None
+
+
+def latest_before(now, hm):
+    """The most recent moment showing clock time hm that is not after now."""
+    h, mi = [int(x) for x in hm.split(":")]
+    dt = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+    return dt if dt <= now else dt - timedelta(days=1)
+
+
+def b36(n, width):
+    n = max(0, int(n))
+    out = ""
+    for _ in range(width):
+        out = B36[n % 36] + out
+        n //= 36
+    return out
+
+
+def unb36(s):
+    n = 0
+    for ch in s:
+        n = n * 36 + B36.index(ch)
+    return n
+
+
+def minutes_of(dt):
+    return dt.hour * 60 + dt.minute
+
+
+def sl_prepare(st, d):
+    """Make room for date d in the sleep log; returns its index."""
+    if st["sl_start"] == "-":
+        st["sl_start"] = str(d)
+    start = pdate(st["sl_start"])
+    i = (d - start).days
+    if i < 0:
+        st["sl_nights"] = "." * 8 * (-i) + st["sl_nights"]
+        st["sl_naps"] = "." * (-i) + st["sl_naps"]
+        st["sl_start"], i = str(d), 0
+    st["sl_nights"] = st["sl_nights"].ljust((i + 1) * 8, ".")
+    st["sl_naps"] = st["sl_naps"].ljust(len(st["sl_nights"]) // 8, ".")
+    return i
+
+
+def sl_trim(st):
+    n = len(st["sl_nights"]) // 8
+    if n > SLEEP_KEEP:
+        cut = n - SLEEP_KEEP
+        st["sl_nights"], st["sl_naps"] = st["sl_nights"][cut * 8:], st["sl_naps"][cut:]
+        st["sl_start"] = str(pdate(st["sl_start"]) + timedelta(days=cut))
+
+
+def sl_put_night(st, d, bed, wake, dur, gap):
+    i = sl_prepare(st, d)
+    rec = b36(min(287, round(bed / 5.0)), 2) + b36(min(287, round(wake / 5.0)), 2) + b36(round(dur / 5.0), 2) + b36(round(gap / 5.0), 2)
+    n = st["sl_nights"]
+    st["sl_nights"] = n[:i * 8] + rec + n[i * 8 + 8:]
+    sl_trim(st)
+
+
+def sl_del_night(st, d):
+    if st["sl_start"] == "-":
+        return
+    i = (d - pdate(st["sl_start"])).days
+    if 0 <= i < len(st["sl_nights"]) // 8:
+        n = st["sl_nights"]
+        st["sl_nights"] = n[:i * 8] + "." * 8 + n[i * 8 + 8:]
+
+
+def sl_add_nap(st, d, minutes):
+    i = sl_prepare(st, d)
+    cur = st["sl_naps"][i]
+    total = (B36.index(cur) * 10 if cur in B36 else 0) + int(minutes)
+    st["sl_naps"] = st["sl_naps"][:i] + B36[min(35, int(round(total / 10.0)))] + st["sl_naps"][i + 1:]
+    sl_trim(st)
+
+
+def sl_nights(st):
+    """All logged nights as dicts, oldest first. 'date' is the day you woke up."""
+    if st["sl_start"] == "-":
+        return []
+    start, res = pdate(st["sl_start"]), []
+    for i in range(len(st["sl_nights"]) // 8):
+        rec = st["sl_nights"][i * 8:i * 8 + 8]
+        if "." in rec or any(c not in B36 for c in rec):
+            continue
+        res.append(dict(date=start + timedelta(days=i), bed=unb36(rec[0:2]) * 5, wake=unb36(rec[2:4]) * 5,
+                        dur=unb36(rec[4:6]) * 5, gap=unb36(rec[6:8]) * 5))
+    return res
+
+
+def sl_nap_days(st, today, days=7):
+    if st["sl_start"] == "-":
+        return []
+    start, res = pdate(st["sl_start"]), []
+    for i, c in enumerate(st["sl_naps"]):
+        d = start + timedelta(days=i)
+        if c in B36 and c != "0" and today - timedelta(days=days - 1) <= d <= today:
+            res.append((d, B36.index(c) * 10))
+    return res
+
+
+def sl_write(st, start, end, gaps):
+    """Record a finished night. Returns (dict, None) or (None, reason)."""
+    total = int((end - start).total_seconds() // 60)
+    net = total - int(gaps)
+    if total <= 0:
+        return None, "that would end before it began"
+    if net < MIN_SLEEP:
+        return None, "short"
+    rec = dict(date=end.date(), bed=minutes_of(start), wake=minutes_of(end), dur=net, gap=int(gaps), start=start, end=end)
+    sl_put_night(st, end.date(), rec["bed"], rec["wake"], net, int(gaps))
+    st["sl_last"] = f"{start:%Y-%m-%dT%H:%M}_{int(gaps)}_{end:%Y-%m-%dT%H:%M}"
+    return rec, None
+
+
+def sl_last_parts(st):
+    p = st["sl_last"].split("_")
+    if len(p) != 3 or not p[1].isdigit():
+        return None
+    a, b = pstamp(p[0]), pstamp(p[2])
+    return (a, int(p[1]), b) if a and b else None
+
+
+def avg_of(nights, today, days):
+    sel = [n["dur"] for n in nights if today - timedelta(days=days - 1) <= n["date"] <= today]
+    return (int(round(sum(sel) / len(sel))), len(sel)) if sel else (None, 0)
+
+
+def sleep_done_text(st, rec, today):
+    s = f"😴 You slept {fmt_min(rec['dur'])} ({rec['start']:%H:%M} to {rec['end']:%H:%M})"
+    if rec["gap"]:
+        s += f", with {rec['gap']} min awake in the night"
+    s += f". Goal {fmt_min(st['sl_goal'])}: " + ("reached 🎉" if rec["dur"] >= st["sl_goal"] else f"{fmt_min(st['sl_goal'] - rec['dur'])} short.")
+    avg = sleep_avg_text(st, today)
+    if avg and len([n for n in sl_nights(st) if n["date"] >= today - timedelta(days=6)]) >= 2:
+        s += f"\n7-day average: {avg}."
+    return s
+
+
+def sleep_avg_text(st, today):
+    a7, n7 = avg_of(sl_nights(st), today, 7)
+    return f"{fmt_min(a7)} ({n7} night{'s' if n7 != 1 else ''})" if a7 is not None else None
+
+
+def clock_spread(values):
+    """Average clock time and spread (minutes) for times around midnight; (None, None) with fewer than 3 values."""
+    if len(values) < 3:
+        return None, None
+    shifted = [(v - 720) % 1440 for v in values]
+    mean = sum(shifted) / float(len(shifted))
+    sd = (sum((x - mean) ** 2 for x in shifted) / len(shifted)) ** 0.5
+    return int(round(mean + 720)) % 1440, int(round(sd))
+
+
+def steadiness(sd):
+    return "very steady" if sd <= 30 else "fairly steady" if sd <= 60 else "quite variable"
+
+
+def night_line(n, goal):
+    s = f"{fmt_min(n['dur'])} ({hm_of(n['bed'])} to {hm_of(n['wake'])})"
+    if n["gap"]:
+        s += f", {n['gap']} min awake in the night"
+    diff = n["dur"] - goal
+    s += f". Goal {fmt_min(goal)}: " + ("reached 🎉" if diff >= 0 else f"{fmt_min(-diff)} short")
+    return s
+
+
+def sleep_stats_text(st, now):
+    today = now.date()
+    nights = sl_nights(st)
+    goal = st["sl_goal"]
+    lines = [f"😴 Your sleep, {NAME}"]
+    state, since = st["sl_state"], pstamp(st["sl_since"])
+    if state == "asleep" and since:
+        lines.append(f"Now: asleep since {since:%H:%M} ({fmt_min(int((now - since).total_seconds() // 60))} so far).")
+    elif state == "wake" and since:
+        lines.append("Now: awake in the night. Say 'sleeping' when you're back asleep.")
+    elif state == "nap" and since:
+        lines.append(f"Now: napping since {since:%H:%M}.")
+    else:
+        lines.append("Now: not tracking. Send 'sleeping' when you drift off.")
+    if not nights:
+        lines.append("No nights logged yet. Send 'sleeping' when you fall asleep and 'awake' when you wake up.")
+    else:
+        last = [n for n in nights if n["date"] >= today - timedelta(days=1)]
+        lines.append("Last night: " + night_line(last[-1], goal) if last else "Last night: not logged.")
+        a7, n7 = avg_of(nights, today, 7)
+        a30, n30 = avg_of(nights, today, 30)
+        nn = lambda n: f"{n} night{'s' if n != 1 else ''}"
+        lines.append("Average: " + (f"7 days {fmt_min(a7)} ({nn(n7)})" if a7 is not None else "7 days n/a")
+                     + (f" | 30 days {fmt_min(a30)} ({nn(n30)})" if a30 is not None else ""))
+        hit7 = sum(1 for n in nights if today - timedelta(days=6) <= n["date"] <= today and n["dur"] >= goal)
+        hit30 = sum(1 for n in nights if today - timedelta(days=29) <= n["date"] <= today and n["dur"] >= goal)
+        lines.append(f"Goal {fmt_min(goal)}: hit {hit7} of {nn(n7)} this week, {hit30} of {nn(n30)} in 30 days.")
+        recent = [n for n in nights if n["date"] >= today - timedelta(days=13)]
+        bed, bsd = clock_spread([n["bed"] for n in recent])
+        wak, wsd = clock_spread([n["wake"] for n in recent])
+        if bed is not None:
+            lines.append(f"Falling asleep around {hm_of(bed)} (±{bsd} min, {steadiness(bsd)}), waking around {hm_of(wak)} (±{wsd} min, {steadiness(wsd)}).")
+    naps = sl_nap_days(st, today)
+    if naps:
+        lines.append(f"Naps (7 days): {len(naps)} day{'s' if len(naps) != 1 else ''}, about {fmt_min(sum(m for _, m in naps))} in total (not in the averages).")
+    lines.append("Change the goal: set sleep 7h30")
+    return "\n".join(lines)
+
+
+FEEL_WORDS = {
+    "stressed": "stressed", "stress": "stressed", "anxious": "stressed", "overwhelmed": "stressed", "worried": "stressed",
+    "nervous": "stressed", "tense": "stressed", "pressured": "stressed", "panicked": "stressed", "uneasy": "stressed",
+    "sad": "low", "down": "low", "lonely": "low", "depressed": "low", "empty": "low", "hopeless": "low", "worthless": "low",
+    "low": "low", "blue": "low", "gloomy": "low", "numb": "low", "discouraged": "low", "heavy": "low", "hurt": "low",
+    "angry": "frustrated", "annoyed": "frustrated", "irritated": "frustrated", "frustrated": "frustrated", "mad": "frustrated",
+    "upset": "frustrated", "furious": "frustrated", "irritable": "frustrated", "resentful": "frustrated",
+    "tired": "tired", "sleepy": "tired", "exhausted": "tired", "drained": "tired", "weary": "tired", "fatigued": "tired",
+    "worn": "tired", "burnt": "tired", "burned": "tired",
+    "calm": "calm", "relaxed": "calm", "peaceful": "calm", "content": "calm", "chill": "calm", "serene": "calm", "settled": "calm",
+    "good": "good", "great": "good", "happy": "good", "amazing": "good", "excited": "good", "proud": "good", "grateful": "good",
+    "motivated": "good", "energetic": "good", "awesome": "good", "fine": "good", "okay": "good", "ok": "good", "alright": "good",
+    "joyful": "good", "hopeful": "good", "confident": "good", "blessed": "good", "better": "good", "thankful": "good",
+    "fantastic": "good", "wonderful": "good", "refreshed": "good", "positive": "good", "inspired": "good", "productive": "good",
+    "well": "good",
+}
+FEEL_DARK = {"hopeless", "worthless", "suicidal", "trapped", "desperate", "broken"}
+FEEL_STOP = {"like", "that", "the", "a", "an", "as", "it", "my", "this", "your", "you", "we", "i", "me", "to", "in", "at", "on",
+             "for", "about", "if", "how", "what", "free", "up", "out", "of", "so", "very", "really", "just", "kind", "bit", "not",
+             "no", "yes", "is", "was", "be", "and", "but", "when", "then", "sure", "some", "any", "there", "here", "something"}
+ADV = (r"(?:really|so|very|just|still|kinda|kind of|quite|pretty|honestly|actually|currently|always|now|a bit|a little|rather|fairly|"
+       r"slightly|incredibly|totally|completely|absolutely|too|extra|super|more|bit|little|sort of|somewhat)")
+RE_FEELING = re.compile(
+    r"^(?:(?:i['’]?m|im|i\s+am|i)\s+)?(?:" + ADV + r"\s+)*(not\s+)?(?:feel|feeling)\s+(?:" + ADV + r"\s+)*"
+    r"([a-z][a-z'\-]{1,19})(?:\s+(?:and|&)\s+([a-z][a-z'\-]{1,19}))?\b(.*)$", re.I | re.S)
+RE_REASON = re.compile(r"\b(?:because(?:\s+of)?|cause|cuz|due\s+to|about|over|since)\s+(.+)$", re.I | re.S)
+GOOD_WORDS = {w for w, c in FEEL_WORDS.items() if c in ("good", "calm")}
+
+
+def extract_feeling(text):
+    """'I am feeling bored tonight because ...' -> (emotion, the word you used, reason or None); None if not a feeling."""
+    t = re.sub(r"\s+", " ", (text or "").strip().lower().replace("’", "'"))
+    t = re.sub(r"^(?:well|honestly|so|hey|um|uh|yeah|ok|okay|hi|hello)[,\s]+", "", t)
+    m = RE_FEELING.match(t)
+    if not m:
+        return None
+    neg, w1, w2, rest = m[1], m[2], m[3], m[4]
+    if w1 in FEEL_STOP or len(w1) < 3:
+        return None
+    word = w1 + (" and " + w2 if w2 else "")
+    if neg:
+        if w1 not in GOOD_WORDS:
+            return None
+        emo, word = "low", "not " + w1
+    else:
+        emo = FEEL_WORDS.get(w1, w1)
+    r = RE_REASON.search(rest or "")
+    why = re.sub(r"[.!?\s]+$", "", r[1]).strip() if r else None
+    return emo, word, (why or None)
 
 
 # ---------------------------------------------------------------- reminders
@@ -573,9 +920,11 @@ LABELS = {L_AWAKE: "awake", L_VIDEO: "hint_video", L_WORK: "atwork", L_LEAVE: "l
 SLASH = {"/start": "start", "/status": "status", "/help": "help", "/stats": "stats", "/menu": "menu", "/wd": "wd",
          "/cancel": "cancel", "/feel": "feel", "/feelings": "feelings", "/export": "export", "/awake": "awake",
          "/atwork": "atwork", "/leaving": "leave", "/leave": "leave", "/outdoor": "outdoor", "/photo": "hint_photo",
-         "/video": "hint_video", "/reminders": "rlist"}
+         "/video": "hint_video", "/reminders": "rlist", "/sleep": "sleeping", "/sleeping": "sleeping", "/nap": "nap",
+         "/sleepstats": "sleepstats", "/sleepstat": "sleepstats"}
 EXPLICIT = {"setwake", "playlist", "start", "status", "help", "stats", "menu", "wd", "cancel", "feel", "feelings", "export", "rlist", "rremove",
-            "rclear", "redit", "remind", "setrule", "quiet", "buddy", "screen", "diary_show"}
+            "rclear", "redit", "remind", "setrule", "quiet", "buddy", "screen", "diary_show", "sleeping", "nap", "sleepstats",
+            "sleepat"}
 RE_WATER_BTN = re.compile(r"^💧 \+(\d+) ?ml$")
 RE_PAGES_BTN = re.compile(r"^📖 \+(\d+) pages?$")
 
@@ -587,7 +936,21 @@ RE_PAGE = re.compile(r"\bpage\s*(\d+)\b|\bp\.?\s*(\d+)\b", re.I)
 RE_READ = re.compile(r"^/?(?:read|pages?)\s+(\d+)\s*(?:pages?)?\s*$", re.I)
 RE_WATER = re.compile(r"^/?(?:water|drank|drink)\s*([+-]?\d+(?:\.\d+)?)\s*(ml|l|litres?|liters?|glass(?:es)?)?\s*$", re.I)
 RE_SET = re.compile(
-    r"^/?set\s+(wake|workout|work|wakecall|midday|leavecheck|leave|review|water|pages|glass|photo|outdoor|screen|music|winddown)\s*(?:to|at)?\s*(.+)$", re.I)
+    r"^/?set\s+(wake|workout|work|wakecall|midday|leavecheck|leave|review|water|pages|glass|photo|outdoor|screen|music|winddown|sleep)\s*(?:to|at)?\s*(.+)$", re.I)
+RE_SLEEPGOAL = re.compile(r"^/?sleep\s+goal\s*(?:to|at|is)?\s*(.+)$", re.I)
+RE_SLEEPING = re.compile(
+    r"^(?:(?:i['’]?m|im|i\s+am)\s+)?(?:now\s+|finally\s+|officially\s+)?(?:sleeping|asleep|going\s+to\s+sleep|off\s+to\s+sleep|falling\s+asleep|"
+    r"drifting\s+off|dozing\s+off|going\s+to\s+sleep\s+now|sleep|lights\s+out)(?:\s+now|\s+for\s+the\s+night|\s+tonight)?\s*[.!]*$", re.I)
+RE_NAP = re.compile(
+    r"^(?:(?:i['’]?m|im|i\s+am)\s+)?(?:going\s+to\s+|gonna\s+|about\s+to\s+)?(?:take\s+a\s+nap|taking\s+a\s+nap|have\s+a\s+nap|having\s+a\s+nap|napping|nap)"
+    r"(?:\s+now)?\s*[.!]*$", re.I)
+RE_SLEEPAT = re.compile(
+    r"^(?:i\s+|i['’]?ve\s+)?(?:slept|fell\s+asleep|went\s+to\s+sleep|went\s+to\s+bed|was\s+asleep|got\s+to\s+sleep)\s+(?:at|around|by|about|@)\s*(.+?)[.!\s]*$", re.I)
+RE_SLEEPSTATS = re.compile(
+    r"^/?(?:my\s+)?sleep\s*(?:stats?|average|avg|history|log|summary|report|record)\s*$|^how\s+(?:long|much)\s+(?:did|do)\s+i\s+(?:usually\s+)?sleep", re.I)
+RE_BEDHINT = re.compile(
+    r"^(?:i['’]?m\s+|im\s+|i\s+am\s+)?(?:going\s+to\s+bed|heading\s+to\s+bed|off\s+to\s+bed|time\s+for\s+bed|in\s+bed|good\s*night|night\s*night|nighty\s*night)"
+    r"(?:\s+now|\s+everyone|\s+all)?\s*[.!]*$", re.I)
 RE_FOCUS = re.compile(r"^/?focus\b(?:\s+(\d{1,3}))?\s*(.*)$", re.I)
 RE_MOOD = re.compile(r"^/?mood\b(?:\s+([1-5]))?\s*$", re.I)
 RE_DIARY = re.compile(r"^/?(?:diary|journal)\b\s*:?\s*(.*)$", re.I | re.S)
@@ -681,8 +1044,7 @@ def classify(m):
         return "screen", r[1].strip()
     r = RE_WAKE.match(text)
     if r:
-        hm = find_time(r[1] if (":" in r[1] or "m" in r[1].lower()) else r[1] + ":00")[0]
-        return ("setwake", hm) if hm else ("other", text)
+        return ("setwake", r[1].strip()) if parse_clock(r[1]) else ("other", text)
     r = RE_PLAYLIST.match(text)
     if r:
         return "playlist", r[1].strip()
@@ -692,10 +1054,27 @@ def classify(m):
     r = RE_BUDDY.match(text)
     if r:
         return "buddy", r[1].strip()
+    r = RE_SLEEPGOAL.match(text)
+    if r:
+        return "setrule", ("sleep", r[1].strip())
+    if RE_SLEEPSTATS.match(text):
+        return "sleepstats", None
+    if RE_SLEEPING.match(text):
+        return "sleeping", None
+    if RE_NAP.match(text):
+        return "nap", None
+    r = RE_SLEEPAT.match(text)
+    if r and parse_clock(r[1]):
+        return "sleepat", r[1].strip()
+    if RE_BEDHINT.match(text):
+        return "bedhint", None
     for rx in RE_BOOK:
         r = rx.search(text)
         if r:
             return "book", (r[1].strip(), r[2])
+    fe = extract_feeling(text)
+    if fe:
+        return "feeling", fe
     if RE_LEAVE.search(text):
         return "leave", None
     if RE_WORK.search(text):
@@ -788,6 +1167,7 @@ def welcome_text(st, today):
             "• Type / to see every command, or send /menu for tap buttons.\n"
             "• 🎥 videos count as your workout, 📸 photos as your progress photo.\n"
             "• /wd starts your evening wind-down: screen time, how you feel and why, your diary and tomorrow's wake-up time.\n"
+            "• Say 'sleeping' as you drift off and 'awake' when you wake: I track how long you sleep (/sleepstats).\n"
             "• Add reminders by typing, for example: remind daily 7am drink water\n"
             "• Send /help any time for everything I understand.")
 
@@ -799,6 +1179,10 @@ def help_text():
         "• /outdoor, or a video with 'outdoor' in the caption • a 📸 photo = progress photo\n"
         "TASKS\n• /water 500 (or water -250, water 1 l) • /pages 10 or read to page 80\n"
         "• book: <title>, page <n>\n"
+        "SLEEP\n• sleeping (or /sleep) when you actually fall asleep • awake when you wake up (before 05:00 it counts as a night wake, then say sleeping again)\n"
+        "• napping (or /nap), then awake • I slept at 11pm (add a night afterwards) • /sleepstats • set sleep 8h (your goal)\n"
+        "TIMES\n• Every clock time you give me is read back for you to confirm (and I ask AM or PM when it could be either). \"in 20 minutes\" needs no confirmation.\n"
+        "FEELINGS\n• Just say it: I feel bored tonight. I save it to your diary and ask why.\n"
         "EVENING\n• /wd wind-down: screen time, feelings + why, diary, tomorrow's wake-up time • screen 3h20 • /feel (quick check-in)\n"
         "• /wake 6:30 (set tomorrow's wake-up call) • playlist wake <spotify link> (also stressed, low, tired, frustrated, calm, good, focus)\n"
         "• /diary (read today) | /diary 2026-11-05 | /diary <write an entry> • /feelings • /export (diary file)\n"
@@ -839,6 +1223,12 @@ def apply_setrule(st, key, val):
             return "Try: set screen 3h (a daily limit), or set screen off"
         st["targets"]["screen"] = v
         return f"Done. Your daily screen-time limit is {fmt_min(v)}. Log it in /wd or with: screen 3h20. Going over, or not logging it, counts as a miss."
+    if key == "sleep":
+        v = parse_screen(val)
+        if off or not v or not 180 <= v <= 840:
+            return "Try: set sleep 8h (or 7h30). It can be between 3h and 14h."
+        st["sl_goal"] = v
+        return f"Done. Your sleep goal is now {fmt_min(v)}."
     if key in ("water", "pages", "glass"):
         n = re.search(r"\d+(?:\.\d+)?", low)
         if off and key != "glass":
@@ -922,6 +1312,7 @@ def mood_buttons():
 
 
 BOT_COMMANDS = [("wd", "Evening wind-down: screen time, feelings, diary"), ("awake", "Log that you're up"),
+                ("sleep", "Log that you're falling asleep"), ("nap", "Log a nap"), ("sleepstats", "Your sleep average and history"),
                 ("atwork", "Log arriving at work"), ("leaving", "Log leaving work"), ("water", "Log water, e.g. /water 500"),
                 ("pages", "Log reading, e.g. /pages 10"), ("outdoor", "Log your outdoor workout"),
                 ("photo", "Send your progress photo"), ("video", "Log your workout video"),
@@ -1059,12 +1450,15 @@ def run(st, updates, now):
         st["aw_state"], st["aw_at"] = "wd_diary", stamp(now)
         out.append("3) Anything else on your mind? Write it as tonight's diary entry, or type done.")
 
-    def record_emotion(emo):
+    def record_emotion(emo, word=None):
         ev_touch()
-        emo = clean(emo.lower(), 14).replace(" ", "_")
+        w = clean(emo.lower(), 14).replace(" ", "_")
+        emo = FEEL_WORDS.get(w, w)
+        if word is None and emo != w:
+            word = nice(w)
         st["ev_emo"] = emo
         day_set(st, today, emo=EMO_CH.get(emo, "o"))
-        log_diary("feeling", nice(emo))
+        log_diary("feeling", nice(emo) + (f" (you said: {word})" if word and word != nice(emo) else ""))
         return emo
 
     def suggest_music(name, once_flag=True):
@@ -1102,6 +1496,7 @@ def run(st, updates, now):
         else:
             parts.append(f"It's after {REFLECT_AT}, so tonight's reflection has passed. It's all saved in /diary.")
         parts.append(f"Wake-up call tomorrow: {st['next_wake'] if st['next_wake'] != '-' else st['times']['wakecall']}.")
+        parts.append("When you're in bed and drifting off, send 'sleeping' and I'll track your sleep.")
         parts.append(f"Sleep well, {NAME}. 🌙")
         out.append("\n".join(parts))
 
@@ -1125,8 +1520,15 @@ def run(st, updates, now):
             if skip:
                 ask_diary()
                 return
-            emo = record_emotion(text)
-            ask_why(emo, False)
+            fe = extract_feeling(text)
+            emo = record_emotion(fe[0], fe[1]) if fe else record_emotion(text)
+            if fe and fe[2]:
+                ev_touch()
+                st["ev_why"] = clean(fe[2], 120)
+                log_diary("why", f"{nice(emo)}: {fe[2]}")
+                ask_diary()
+            else:
+                ask_why(emo, False)
             suggest_music(emo)
         elif s in ("wd_why", "feel_why"):
             emo = st["aw_emo"]
@@ -1149,13 +1551,451 @@ def run(st, updates, now):
             if low in ("same", "skip", "keep", "no", "-", "done"):
                 finish_wd()
                 return
-            hm = find_time(text if (":" in text or "m" in low) else text.strip() + ":00")[0]
-            if hm is None:
-                out.append("I couldn't read that time. Try 6:30 or 7am, or type same.")
+            slot = parse_clock(text)
+            if slot is None:
+                out.append("I couldn't read that time. Try 6:30 AM or 7am, or type same.")
                 return
-            st["next_wake"] = hm
-            out.append(f"⏰ Wake-up call set for {hm} tomorrow (awake deadline {hm_of(mins(hm) + WAKE_DEADLINE_AFTER)}).")
+            cf_start("wdwake", [slot])
+
+    # ---- time confirmation: nothing that contains a clock time is saved until you confirm it
+    def cf_clear():
+        st["cf_kind"], st["cf_stage"], st["cf_at"], st["cf_data"] = "-", "-", "-", "-"
+
+    def cf_set(kind, stage, a):
+        st["cf_kind"], st["cf_stage"], st["cf_at"] = kind, stage, stamp(now)
+        st["cf_data"] = json.dumps(a, separators=(",", ":"))
+
+    def cf_get():
+        if st["cf_kind"] == "-":
+            return None
+        at = pstamp(st["cf_at"])
+        try:
+            a = json.loads(st["cf_data"])
+        except ValueError:
+            a = None
+        if not at or not isinstance(a, dict) or now - at > timedelta(minutes=CONFIRM_MINUTES):
+            cf_clear()
+            return None
+        return st["cf_kind"], st["cf_stage"], a
+
+    def cf_label(kind, a):
+        x = a.get("x", {})
+        if kind in ("setwake", "wdwake"):
+            return "Setting tomorrow's wake-up call"
+        if kind == "setrule":
+            return f"Setting {x.get('key', 'time')}"
+        if kind == "quiet":
+            return "Setting quiet hours (" + ("start" if a.get("i", 0) == 0 else "end") + " time)"
+        if kind == "remind":
+            return f"New reminder: {x.get('text', '')}"
+        if kind == "redit":
+            return f"Moving reminder {x.get('id')} ({x.get('text', '')})"
+        if kind == "sleepat":
+            return "Logging when you fell asleep"
+        if kind == "wakeq":
+            return "Fixing your wake-up time"
+        return "Logging when you fell back asleep"
+
+    def cf_statement(kind, a):
+        t, x = a["t"], a.get("x", {})
+        if kind in ("setwake", "wdwake"):
+            return f"Wake you tomorrow at {pretty(t[0])}"
+        if kind == "setrule":
+            return f"Set {x['key']} to {pretty(t[0])}"
+        if kind == "quiet":
+            return f"Quiet hours from {pretty(t[0])} to {pretty(t[1])}"
+        if kind == "remind":
+            rem, err = parse_reminder(x["arg"].replace("{T0}", t[0]), now.date(), now.hour * 60 + now.minute)
+            if rem:
+                return f"Remind you at {pretty(rem['time'])}, {describe(rem['rule'], now.date())}: {rem['text']}"
+            return f"Remind you at {pretty(t[0])}: {x.get('text', '')}"
+        if kind == "redit":
+            return f"Move reminder {x['id']} ({x.get('text', '')}) to {pretty(t[0])}"
+        if kind == "sleepat":
+            dt = latest_before(now, t[0])
+            return f"You fell asleep at {pretty(t[0])} ({'today' if dt.date() == now.date() else 'yesterday'})"
+        if kind == "wakeq":
+            return f"You actually woke up at {pretty(t[0])}"
+        return f"You fell back asleep at {pretty(t[0])}"
+
+    def cf_show(kind, a, mid=None):
+        amb = [i for i, v in enumerate(a["t"]) if v.endswith("?")]
+        if amb:
+            i = amb[0]
+            a["i"] = i
+            raw = a["t"][i].rstrip("?")
+            text = f"🕐 {cf_label(kind, a)}\nDid you mean {raw} AM or {raw} PM?"
+            kb = {"inline_keyboard": [[{"text": f"🌅 {raw} AM", "callback_data": "cf:am"}, {"text": f"🌙 {raw} PM", "callback_data": "cf:pm"}],
+                                      [{"text": "✖ Cancel", "callback_data": "cf:no"}]]}
+            cf_set(kind, "ampm", a)
+        else:
+            text = f"🕐 {cf_label(kind, a)}\n{cf_statement(kind, a)}. Is that right?"
+            kb = {"inline_keyboard": [[{"text": "✅ Confirm", "callback_data": "cf:yes"}, {"text": "✏️ Change", "callback_data": "cf:chg"},
+                                       {"text": "✖ Cancel", "callback_data": "cf:no"}]]}
+            cf_set(kind, "confirm", a)
+        if mid:
+            out.append({"k": "edit", "message_id": mid, "text": text, "markup": kb})
+        else:
+            out.append(msg(text, kb))
+
+    def cf_start(kind, slots, x=None, mid=None):
+        a = {"t": list(slots), "x": x or {}}
+        if len(slots) == 1 and slots[0].endswith("?"):
+            a["d"] = 1  # tapping AM or PM is the confirmation
+        cf_show(kind, a, mid)
+
+    def cf_say(mid, text):
+        out.append({"k": "edit", "message_id": mid, "text": text} if mid else text)
+
+    def cf_run(kind, a, mid):
+        cf_clear()
+        if mid:
+            out.append({"k": "edit", "message_id": mid, "text": "✅ " + cf_statement(kind, a) + "."})
+        cf_exec(kind, a)
+
+    def cf_act(action, val=None, mid=None):
+        c = cf_get()
+        if not c:
+            return False
+        kind, stage, a = c
+        if action == "no":
+            cf_clear()
+            cf_say(mid, "✖ Cancelled. Nothing was changed.")
+            if kind == "wdwake":
+                out.append("What time should I wake you tomorrow? Type like 6:30 AM, or 'same' to keep it.")
+            return True
+        if action in ("am", "pm") and stage == "ampm":
+            i = a.get("i", 0)
+            a["t"][i] = resolve_slot(a["t"][i], action)
+            if a.get("d"):
+                cf_run(kind, a, mid)
+            else:
+                cf_show(kind, a, mid)
+            return True
+        if action == "yes" and stage == "confirm":
+            cf_run(kind, a, mid)
+            return True
+        if action == "chg" and stage in ("confirm", "ampm"):
+            if len(a["t"]) != 1:
+                cf_clear()
+                cf_say(mid, "Okay, send the command again with the corrected times.")
+                return True
+            cf_set(kind, "ask", a)
+            cf_say(mid, "✏️ Send the correct time, like 7:30 AM or 19:30 (or type cancel).")
+            return True
+        if action == "time" and len(a["t"]) <= 1 and stage in ("confirm", "ampm", "ask"):
+            a["t"] = [val]
+            a.pop("d", None)
+            if val.endswith("?"):
+                a["d"] = 1
+            cf_show(kind, a, mid)
+            return True
+        if action == "same" and stage == "ask" and kind in ("wakeq", "gapq"):
+            cf_clear()
+            cf_say(mid, "Okay, I'll keep it as it is.")
+            return True
+        return False
+
+    CF_YES = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "confirm", "confirmed", "correct", "right", "sure", "👍", "✅", "that's right", "thats right"}
+    CF_NO = {"no", "n", "nope", "nah", "cancel", "stop", "never mind", "nevermind", "wrong"}
+
+    def cf_text(text0):
+        """Handle a typed reply to a pending confirmation. True if the message was used."""
+        c = cf_get()
+        if not c:
+            return False
+        kind, stage, a = c
+        low = re.sub(r"[.!]+$", "", text0.strip().lower())
+        if low in CF_NO:
+            return cf_act("no")
+        if stage == "confirm" and low in CF_YES:
+            return cf_act("yes")
+        if stage == "confirm" and low in ("change", "edit", "change it", "change time"):
+            return cf_act("chg")
+        if stage == "ampm" and low in ("am", "a.m", "a.m.", "a", "morning"):
+            return cf_act("am")
+        if stage == "ampm" and low in ("pm", "p.m", "p.m.", "p", "evening", "night", "afternoon"):
+            return cf_act("pm")
+        if stage == "ask" and low in ("same", "keep", "skip", "keep it"):
+            return cf_act("same")
+        slot = parse_clock(low)
+        if slot and (stage == "ask" or re.search(r"[:.]|am|pm|a\.m|p\.m", low)):
+            return cf_act("time", slot)
+        return False
+
+    def remind_flow(arg, ts):
+        if RE_IN.search(arg):  # "in 20 minutes" is a fixed amount: no confirmation needed
+            out.append(handle_remind(st, arg, ts))
+            return
+        m = RE_REM_TIME.search(arg)
+        slot = parse_clock(re.sub(r"^at\s+", "", m[0].strip(), flags=re.I)) if m else None
+        if not slot:
+            out.append(handle_remind(st, arg, ts))  # explains what is missing
+            return
+        if len(st["reminders"]) >= MAX_REMINDERS or len(render(st)) > 3500:
+            out.append(handle_remind(st, arg, ts))
+            return
+        marked = (arg[:m.start()] + " {T0} " + arg[m.end():]).strip()
+        cands = [slot] if not slot.endswith("?") else [resolve_slot(slot, "am"), resolve_slot(slot, "pm")]
+        good, err = None, None
+        for c in cands:
+            rem, e = parse_reminder(marked.replace("{T0}", c), ts.date(), ts.hour * 60 + ts.minute)
+            if rem and not good:
+                good = rem
+            err = err or e
+        if not good:
+            out.append(err + "\nExamples: remind 15:00 call mum | remind daily 7am drink water | remind in 20 minutes stretch")
+            return
+        cf_start("remind", [slot], {"arg": marked, "text": good["text"]})
+
+    def cf_exec(kind, a):
+        t, x = a["t"], a.get("x", {})
+        if kind == "setwake":
+            st["next_wake"] = t[0]
+            out.append(f"⏰ Tomorrow's wake-up call is set for {t[0]} ({plain12(t[0])}; awake deadline {hm_of(mins(t[0]) + WAKE_DEADLINE_AFTER)}, "
+                       f"workout video by about {hm_of(mins(t[0]) + WORKOUT_DEADLINE_AFTER)}). It applies from tomorrow morning.")
+        elif kind == "wdwake":
+            st["next_wake"] = t[0]
+            out.append(f"⏰ Wake-up call set for {t[0]} ({plain12(t[0])}) tomorrow (awake deadline {hm_of(mins(t[0]) + WAKE_DEADLINE_AFTER)}).")
             finish_wd()
+        elif kind == "setrule":
+            out.append(apply_setrule(st, x["key"], t[0]))
+        elif kind == "quiet":
+            st["quiet"] = f"{t[0]}-{t[1]}"
+            out.append(f"Quiet hours set: {t[0]} to {t[1]}. Reminders in that window wait until {t[1]}.")
+        elif kind == "remind":
+            out.append(handle_remind(st, x["arg"].replace("{T0}", t[0]), now))
+        elif kind == "redit":
+            r = next((q for q in st["reminders"] if q["id"] == x["id"]), None)
+            if r:
+                r["time"], r["last"] = t[0], "-"
+                out.append(f"Reminder {r['id']} moved to {t[0]} ({plain12(t[0])}): {r['text']}")
+            else:
+                out.append(f"I don't have a reminder {x['id']} any more.")
+        elif kind == "sleepat":
+            sleep_at_exec(t[0])
+        elif kind == "wakeq":
+            sleep_fix_end(t[0], x)
+        elif kind == "gapq":
+            sleep_regap(t[0], x)
+
+    # ---- sleep tracking
+    def sleep_reset():
+        st["sl_state"], st["sl_since"], st["sl_gaps"], st["sl_gapat"] = "-", "-", 0, "-"
+
+    def sleep_logged(rec, note=""):
+        text = sleep_done_text(st, rec, today) + note
+        log_diary("sleep", text.split("\n")[0])
+        return text
+
+    def sleep_ask(kind, text, x):
+        cf_set(kind, "ask", {"t": [], "x": x})
+        out.append(text)
+
+    def handle_sleeping(ts, how=None):
+        state, since = st["sl_state"], pstamp(st["sl_since"])
+        if state == "asleep" and since and ts - since <= timedelta(minutes=MAX_SESSION):
+            out.append(f"💤 I'm already tracking your sleep since {since:%H:%M}. Say 'awake' when you wake up.")
+            return
+        if state == "wake" and since and ts - since <= timedelta(minutes=MAX_SESSION):
+            gapat = pstamp(st["sl_gapat"]) or ts
+            gap = max(0, int((ts - gapat).total_seconds() // 60))
+            st["sl_gaps"] += gap
+            st["sl_state"], st["sl_gapat"] = "asleep", "-"
+            out.append(f"😴 Back to sleep at {ts:%H:%M}. You were awake for {gap} min ({st['sl_gaps']} min in total tonight). Rest well. 🌙")
+            return
+        if state == "nap" and since and ts - since <= timedelta(minutes=MAX_SESSION):
+            out.append(f"😴 You're already napping since {since:%H:%M}. Say 'awake' to end the nap.")
+            return
+        if state != "-":
+            sleep_reset()
+            out.append("💤 Your last sleep was never closed, so I left it out of your averages.")
+        if how is None and 6 <= ts.hour < 18:
+            out.append(msg(f"It's {ts:%H:%M}. Is this your night sleep or a nap?",
+                           {"inline_keyboard": [[{"text": "🌙 Night sleep", "callback_data": f"slk:night:{ts:%Y-%m-%dT%H:%M}"},
+                                                 {"text": "😴 Nap", "callback_data": f"slk:nap:{ts:%Y-%m-%dT%H:%M}"}]]}))
+            return
+        st["sl_state"], st["sl_since"] = ("nap" if how == "nap" else "asleep"), f"{ts:%Y-%m-%dT%H:%M}"
+        if how == "nap":
+            out.append(f"😴 Nap started at {ts:%H:%M}. Say 'awake' when you're up.")
+        else:
+            wc = st["next_wake"] if st["next_wake"] != "-" else st["times"]["wakecall"]
+            out.append(f"😴 Sleep started at {ts:%H:%M}. Goodnight, {NAME}. 🌙\n"
+                       f"Woken in the night? Say 'awake', then 'sleeping' again and I'll subtract the time awake.\nWake-up call: {wc}.")
+
+    def sleep_wake_mode(ts):
+        state = st["sl_state"]
+        if state == "nap":
+            return "nap"
+        if state in ("asleep", "wake"):
+            since = pstamp(st["sl_since"])
+            if since and ts - since > timedelta(minutes=MAX_SESSION):
+                return "morning"
+            cutoff = min(NIGHT_CUTOFF, (tm(st, "wakecall") or 300) - 30)
+            return "night" if minutes_of(ts) < cutoff else "morning"
+        return "none"
+
+    def sleep_night_wake(ts):
+        if st["sl_state"] == "wake":
+            g = pstamp(st["sl_gapat"])
+            out.append(f"🌙 I already have you awake since {g:%H:%M}. Say 'sleeping' when you're back asleep." if g else "🌙 Say 'sleeping' when you're back asleep.")
+            return
+        st["sl_state"], st["sl_gapat"] = "wake", f"{ts:%Y-%m-%dT%H:%M}"
+        out.append(msg(f"🌙 Awake at {ts:%H:%M}, noted. Say 'sleeping' when you're back asleep and I'll subtract the time awake.\n"
+                       "If you're up for the day, tap below.",
+                       {"inline_keyboard": [[{"text": "☀️ I'm up for the day", "callback_data": "sl:up"}]]}))
+
+    def sleep_nap_end(ts):
+        since = pstamp(st["sl_since"])
+        sleep_reset()
+        n = int((ts - since).total_seconds() // 60) if since else 0
+        if n < MIN_NAP:
+            out.append("😴 That nap was under 5 minutes, so I didn't count it.")
+        elif n > 8 * 60:
+            out.append("😴 That nap would be over 8 hours, so I left it out. If it was a night's sleep, use 'sleeping' at night.")
+        else:
+            sl_add_nap(st, since.date(), n)
+            text = f"😴 Nap logged: {fmt_min(n)} ({since:%H:%M} to {ts:%H:%M}). Naps are kept out of your night averages."
+            log_diary("sleep", text)
+            out.append(text)
+
+    def sleep_morning(ts):
+        since = pstamp(st["sl_since"])
+        if not since or ts - since > timedelta(minutes=MAX_SESSION):
+            sleep_reset()
+            out.append("💤 I never got an end for your last sleep, so I left it out of your averages. Tonight, send 'sleeping' when you drift off.")
+            return
+        if st["sl_state"] == "wake":
+            gapat = pstamp(st["sl_gapat"]) or ts
+            rec, why = sl_write(st, since, gapat, st["sl_gaps"])
+            sleep_reset()
+            if not rec:
+                out.append("😴 That sleep was too short to count.")
+                return
+            out.append(sleep_logged(rec, f"\nI ended it at {gapat:%H:%M}, when you woke in the night and didn't tell me you went back to sleep."))
+            sleep_ask("gapq", f"Did you fall back asleep after {gapat:%H:%M}? Send the time you fell asleep again (like 4:00 AM), or reply 'no'.",
+                      {"awake": f"{ts:%Y-%m-%dT%H:%M}"})
+            return
+        net = int((ts - since).total_seconds() // 60) - st["sl_gaps"]
+        if MIN_SLEEP <= net < SHORT_NIGHT:
+            sleep_reset()
+            sl_add_nap(st, since.date(), net)
+            text = f"😴 That was {fmt_min(net)} ({since:%H:%M} to {ts:%H:%M}), under {fmt_min(SHORT_NIGHT)}, so I counted it as a nap and kept it out of your night averages."
+            log_diary("sleep", text)
+            out.append(text)
+            return
+        rec, why = sl_write(st, since, ts, st["sl_gaps"])
+        sleep_reset()
+        if not rec:
+            out.append("😴 That sleep was under 10 minutes, so I didn't count it." if why == "short" else "😴 I couldn't work out that sleep.")
+            return
+        out.append(sleep_logged(rec))
+        wc = tm(st, "wakecall") or 300
+        if minutes_of(ts) > wc + LATE_AWAKE_AFTER or rec["dur"] > LONG_SLEEP:
+            sleep_ask("wakeq", f"⏰ You logged awake at {ts:%H:%M}, which is late. Did you actually wake up earlier? Send the real time (like 8:30 AM), "
+                      f"or reply 'same' if {ts:%H:%M} is right.", {"def": f"{ts:%H:%M}", "max": f"{ts:%Y-%m-%dT%H:%M}"})
+
+    def sleep_fix_end(hm, x):
+        last = sl_last_parts(st)
+        if not last:
+            out.append("I don't have a finished sleep to fix.")
+            return
+        start, gaps, old_end = last
+        mx = pstamp(x.get("max")) or old_end
+        end = latest_before(mx, hm)
+        if end <= start:
+            out.append(f"That would be before you fell asleep ({start:%H:%M}), so I kept it as it was.")
+            return
+        sl_del_night(st, old_end.date())
+        rec, why = sl_write(st, start, end, gaps)
+        out.append("✅ Updated. " + sleep_logged(rec) if rec else "I couldn't use that time, so I kept it as it was.")
+
+    def sleep_regap(hm, x):
+        last = sl_last_parts(st)
+        awake = pstamp(x.get("awake"))
+        if not last or not awake:
+            out.append("I don't have that sleep any more.")
+            return
+        start, gaps, old_end = last
+        again = latest_before(awake, hm)
+        if again <= old_end or again >= awake:
+            out.append(f"That doesn't fit between {old_end:%H:%M} and {awake:%H:%M}, so I kept it as it was.")
+            return
+        sl_del_night(st, old_end.date())
+        rec, why = sl_write(st, start, awake, gaps + int((again - old_end).total_seconds() // 60))
+        out.append("✅ Updated. " + sleep_logged(rec) if rec else "I couldn't use that time, so I kept it as it was.")
+
+    def sleep_at_exec(hm):
+        dt = latest_before(now, hm)
+        state = st["sl_state"]
+        if state in ("asleep", "wake"):
+            st["sl_since"] = f"{dt:%Y-%m-%dT%H:%M}"
+            out.append(f"✅ Got it: you fell asleep at {dt:%H:%M}. I'm still tracking, say 'awake' when you wake up.")
+            return
+        if state == "nap":
+            out.append("You're napping right now. Send 'awake' to end the nap first.")
+            return
+        last = sl_last_parts(st)
+        if last and last[2].date() == today and dt < last[2]:
+            sl_del_night(st, last[2].date())
+            rec, why = sl_write(st, dt, last[2], last[1])
+            out.append("✅ Updated. " + sleep_logged(rec) if rec else "That doesn't fit with when you woke up, so I kept it as it was.")
+            return
+        if st["wake_t"] != "-" and st["today"] == str(today):
+            end = pstamp(f"{today}T{st['wake_t']}")
+            if end and dt < end:
+                rec, why = sl_write(st, dt, end, 0)
+                out.append(sleep_logged(rec) if rec else "That sleep was too short to count.")
+                return
+        st["sl_state"], st["sl_since"], st["sl_gaps"], st["sl_gapat"] = "asleep", f"{dt:%Y-%m-%dT%H:%M}", 0, "-"
+        out.append(f"✅ Sleep started at {dt:%H:%M}. Say 'awake' when you wake up.")
+
+    def handle_awake(ts, t, seed, force=False):
+        mode = "morning" if force and st["sl_state"] in ("asleep", "wake") else sleep_wake_mode(ts)
+        if mode == "night":
+            sleep_night_wake(ts)
+            return
+        if mode == "nap":
+            sleep_nap_end(ts)
+            return
+        if st["wake_t"] == "-":
+            st["wake_t"] = t
+            out.append(ack(t, st["wake"], today < START, seed))
+        else:
+            out.append(f"Already logged you up at {st['wake_t']}. 👍")
+        if mode == "morning":
+            sleep_morning(ts)
+        elif ts.hour < 12 and "sleephint" not in st["sent"] and not any(n["date"] == ts.date() for n in sl_nights(st)):
+            st["sent"].append("sleephint")
+            out.append("💤 I didn't catch when you fell asleep. Add it with: I slept at 11pm (I'll confirm the time). Tonight, send 'sleeping' as you drift off.")
+
+    def handle_feeling(emo, word, why):
+        emo = record_emotion(emo, word)
+        if word in FEEL_DARK or emo in FEEL_DARK:
+            out.append(f"I'm sorry it feels this heavy, {NAME}. You don't have to carry it alone. Please tell someone you trust tonight, "
+                       "and if you ever feel unsafe, contact local emergency services or a crisis line right away. 🧡")
+        if why:
+            ev_touch()
+            st["ev_why"] = clean(why, 120)
+            log_diary("why", f"{nice(emo)}: {why}")
+            clear_await()
+            out.append(f"Noted: feeling {nice(emo)} ({why}). Saved to your diary. 🧡")
+        else:
+            ask_why(emo, True)
+        suggest_music(emo)
+
+    def answers_await(kind, text0, is_cmd_):
+        """Is this message the answer to the question I'm waiting on, rather than a new command?"""
+        if kind in EXPLICIT or kind in ("workout", "outdoor", "photo", "bedhint") or is_cmd_:
+            return False
+        if st["aw_state"] in ("feel_why", "wd_why", "wd_diary"):
+            if kind in ("water", "pages", "focus", "mood"):
+                return False
+            if kind == "feeling":
+                return st["aw_state"] != "feel_why"
+            if kind in ("atwork", "leave", "awake", "page", "book"):
+                return len(text0.split()) > 3
+        return True
 
     if st["aw_state"] != "-":
         try:
@@ -1194,6 +2034,26 @@ def run(st, updates, now):
                 out.append({"k": "edit", "message_id": mid, "text": f"Mood saved: {['😞', '😕', '😐', '🙂', '😄'][n - 1]} {n}/5"})
                 if n <= 2:
                     suggest_music("low")
+            elif data.startswith("cf:"):
+                action = data.split(":", 1)[1]
+                if cf_act(action, None, mid):
+                    out.append({"k": "answer", "id": cq["id"], "text": ""})
+                else:
+                    out.append({"k": "answer", "id": cq["id"], "text": "That one already expired or was handled."})
+                    out.append({"k": "edit", "message_id": mid, "text": mtxt + "\n(expired, please send it again)"})
+            elif data.startswith("slk:"):
+                _, how, st_ts = data.split(":", 2)
+                when = pstamp(st_ts) or now
+                out.append({"k": "answer", "id": cq["id"], "text": "Noted"})
+                out.append({"k": "edit", "message_id": mid, "text": f"{'😴 Nap' if how == 'nap' else '🌙 Night sleep'} at {when:%H:%M}"})
+                handle_sleeping(when, how)
+            elif data in ("sl:up", "sl:still"):
+                out.append({"k": "answer", "id": cq["id"], "text": "Noted"})
+                if data == "sl:up":
+                    out.append({"k": "edit", "message_id": mid, "text": f"☀️ Up at {now:%H:%M}"})
+                    handle_awake(now, f"{now:%H:%M}", f"{cq['id']}up", force=True)
+                else:
+                    out.append({"k": "edit", "message_id": mid, "text": "💤 Okay, rest a little longer. I'll check on you again soon."})
             else:
                 out.append({"k": "answer", "id": cq["id"], "text": ""})
             continue
@@ -1214,16 +2074,26 @@ def run(st, updates, now):
         g = st["targets"]
         text0 = re.sub(r"^(/\w+)@\w+", r"\1", (m.get("text") or m.get("caption") or "").strip())
         is_cmd = text0.startswith("/") or text0 in LABELS or RE_WATER_BTN.match(text0) or RE_PAGES_BTN.match(text0)
-        if (st["aw_state"] != "-" and text0 and kind not in EXPLICIT
-                and kind not in ("workout", "outdoor", "photo") and not is_cmd):
+        if text0 and kind not in ("workout", "outdoor", "photo") and cf_text(text0):
+            continue
+        if st["aw_state"] != "-" and text0 and answers_await(kind, text0, is_cmd):
             handle_await(text0)
             continue
         if kind == "awake":
-            if st["wake_t"] == "-":
-                st["wake_t"] = t
-                out.append(ack(t, st["wake"], test, seed))
-            else:
-                out.append(f"Already logged you up at {st['wake_t']}. 👍")
+            handle_awake(ts, t, seed)
+        elif kind == "sleeping":
+            handle_sleeping(ts)
+        elif kind == "nap":
+            handle_sleeping(ts, "nap")
+        elif kind == "sleepat":
+            cf_start("sleepat", [parse_clock(data)])
+        elif kind == "sleepstats":
+            out.append(sleep_stats_text(st, now))
+        elif kind == "bedhint":
+            out.append(f"Rest well, {NAME}. 🌙 Send 'sleeping' once you actually drift off and I'll start your sleep timer." if st["sl_state"] == "-"
+                       else f"Sweet dreams, {NAME}. I'm already tracking your sleep. 💤")
+        elif kind == "feeling":
+            handle_feeling(*data)
         elif kind == "workout":
             if st["workout_t"] == "-":
                 st["workout_t"] = t
@@ -1321,9 +2191,7 @@ def run(st, updates, now):
                 if st["aw_state"] == "wd_screen":
                     ask_emotion()
         elif kind == "setwake":
-            st["next_wake"] = data
-            out.append(f"⏰ Tomorrow's wake-up call is set for {data} (awake deadline {hm_of(mins(data) + WAKE_DEADLINE_AFTER)}, "
-                       f"workout video by about {hm_of(mins(data) + WORKOUT_DEADLINE_AFTER)}). It applies from tomorrow morning.")
+            cf_start("setwake", [parse_clock(data)])
         elif kind == "playlist":
             parts = data.split(None, 1)
             if not parts:
@@ -1344,6 +2212,7 @@ def run(st, updates, now):
             out.append(msg("How are you feeling right now?", emotion_buttons()))
         elif kind == "cancel":
             clear_await()
+            cf_clear()
             out.append("Okay, cancelled.")
         elif kind == "menu":
             out.append(msg("Tap one 👇 (the buttons hide after you tap).", keyboard_for(st)))
@@ -1360,11 +2229,10 @@ def run(st, updates, now):
                 out.append("Quiet hours are off.")
             else:
                 parts = re.split(r"\s*(?:-|to|until)\s*", low)
-                a = find_time(parts[0])[0] if parts else None
-                b = find_time(parts[1])[0] if len(parts) > 1 else None
+                a = parse_clock(parts[0]) if parts else None
+                b = parse_clock(parts[1]) if len(parts) > 1 else None
                 if a and b:
-                    st["quiet"] = f"{a}-{b}"
-                    out.append(f"Quiet hours set: {a} to {b}. Reminders in that window wait until {b}.")
+                    cf_start("quiet", [a, b])
                 else:
                     out.append("Try: quiet 22:30-05:00  or  quiet off")
         elif kind == "buddy":
@@ -1391,9 +2259,14 @@ def run(st, updates, now):
                 st["page"] = str(newp)
                 out.append(f"Page {newp} saved. 📖")
         elif kind == "setrule":
-            out.append(apply_setrule(st, *data))
+            key, val = data
+            slot = parse_clock(val) if key in TIME_KEYS and val.lower().strip() not in ("off", "none", "stop", "disable", "no") else None
+            if slot:
+                cf_start("setrule", [slot], {"key": key})
+            else:
+                out.append(apply_setrule(st, key, val))
         elif kind == "remind":
-            out.append(handle_remind(st, data, ts))
+            remind_flow(data, ts)
         elif kind == "rlist":
             out.append(reminders_text(st, ts.date()))
         elif kind == "rremove":
@@ -1413,10 +2286,9 @@ def run(st, updates, now):
                 r["text"] = rest[5:].replace("|", "/").strip()[:60] or r["text"]
                 out.append(f"Reminder {rid} text updated.")
             else:
-                hm = find_time(rest)[0]
-                if hm:
-                    r["time"], r["last"] = hm, "-"
-                    out.append(f"Reminder {rid} moved to {hm}: {r['text']}")
+                slot = parse_clock(rest)
+                if slot:
+                    cf_start("redit", [slot], {"id": rid, "text": r["text"]})
                 else:
                     out.append("I couldn't read that time. Try: change 2 to 16:30 or change 2 to 4:30pm")
         elif kind == "status":
@@ -1437,7 +2309,8 @@ def run(st, updates, now):
         st["cmdver"] = CMDVER
         out.append({"k": "commands"})
         out.append("🆕 Updated! Type / to see every command. /menu shows tap buttons (they only appear when you ask). "
-                   "/wd starts your evening wind-down: screen time, feelings and why, and your diary.")
+                   "New: a sleep tracker (send 'sleeping' as you drift off and 'awake' when you wake, /sleepstats shows your average), "
+                   "I confirm every clock time you give me before saving it, and 'I feel ...' goes straight into your diary.")
 
     # custom reminders (work every day, including test days). Quiet hours defer them to the morning.
     keep = []
@@ -1478,7 +2351,11 @@ def run(st, updates, now):
 
     wake_d, work_out_d, work_d = mins(st["wake"]), mins(st["workout"]), mins(st["work"])
     once("wakecall", tm(st, "wakecall"), True, wake_call(st), 6 * 60)
-    once("wakenudge", wake_d + 1, st["wake_t"] == "-",
+    sleeping_now = st["sl_state"] in ("asleep", "wake")
+    once("sleepcheck", wake_d, st["wake_t"] == "-" and sleeping_now,
+         msg(f"☀️ It's {st['wake']}, {NAME}. Are you awake? Or just checking in. Tap below, or text me when you're up.",
+             {"inline_keyboard": [[{"text": "☀️ I'm awake", "callback_data": "sl:up"}, {"text": "💤 Still sleeping", "callback_data": "sl:still"}]]}), 120)
+    once("wakenudge", wake_d + 1, st["wake_t"] == "-" and not sleeping_now,
          f"It's past {st['wake']}, {NAME}. Text me you're up and get moving. ⏰", 120)
     once("wakenudge2", wake_d + 45, st["wake_t"] == "-",
          f"{NAME}, still nothing from you. Up now, workout next.", 120)
@@ -1671,7 +2548,7 @@ def deliver(tg, chat, st, out):
                 tg.send("📓 Your diary is empty, so there's nothing to export yet.", REMOVE_KB)
         elif item["k"] == "edit":
             tg.call("editMessageText", chat_id=chat, message_id=item["message_id"], text=item["text"],
-                    reply_markup=json.dumps({"inline_keyboard": []}))
+                    reply_markup=json.dumps(item.get("markup") or {"inline_keyboard": []}))
         elif item["k"] == "answer":
             tg.call("answerCallbackQuery", callback_query_id=item["id"], text=item["text"])
         elif item["k"] == "buddy":
@@ -1690,6 +2567,10 @@ def fit(st, text):
         text = render(st, updated=st["updated"])
     while len(text) > 4000 and len(st["hist"]) > 14:
         date_cut(st)
+        text = render(st, updated=st["updated"])
+    while len(text) > 4000 and len(st["sl_nights"]) > 8 * 14:
+        st["sl_nights"], st["sl_naps"] = st["sl_nights"][8:], st["sl_naps"][1:]
+        st["sl_start"] = str(pdate(st["sl_start"]) + timedelta(days=1))
         text = render(st, updated=st["updated"])
     return text
 

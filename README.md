@@ -26,6 +26,13 @@ No Claude usage, no server.
 - "leaving early" or "left work" (sends an evening plan)
 - `book: Atomic Habits, page 45`, `read to page 80`
 - `set wake 05:45` (also `workout`, `work`), `/status`, `/help`
+- Sleep tracker: `sleeping` (or `/sleep`) when you fall asleep, `awake` when you wake. Before 05:00 an `awake`
+  is a night wake (say `sleeping` again and the time awake is subtracted). `napping`, `I slept at 11pm`,
+  `/sleepstats`, `set sleep 8h` (goal). If you log awake very late, it asks when you really woke up.
+- Every clock time you give it (wake-up call, `set ...`, `quiet`, `remind 15:00`, `change 2 to ...`, past sleep)
+  is read back with Confirm / Change / Cancel buttons, and it asks AM or PM when a time could be either.
+  Relative times such as `remind in 20 minutes` need no confirmation.
+- Say `I feel bored tonight` and it is saved to the diary, then it asks why and saves your answer too.
 
 ## Notes
 
