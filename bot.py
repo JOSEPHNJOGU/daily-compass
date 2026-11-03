@@ -15,7 +15,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 TZ = timezone(timedelta(hours=3))  # Nairobi, no daylight saving
 
@@ -275,7 +275,7 @@ def rule_matches(rule, d):
         return d.weekday() >= 5
     if rule.startswith("days:"):
         return DAYNAMES[d.weekday()] in rule[5:].split(",")
-    if rule.startswith("once:"):
+    if rule.startswith(("once:", "soon:")):
         return rule[5:] == str(d)
     return False
 
@@ -285,6 +285,8 @@ def describe(rule, today=None):
         return rule
     if rule.startswith("days:"):
         return "every " + ", ".join(x.capitalize() for x in rule[5:].split(","))
+    if rule.startswith("soon:"):
+        return "timer"
     if rule.startswith("once:"):
         d = rule[5:]
         if today and d == str(today):
@@ -371,20 +373,46 @@ def add_reminder(st, time_hm, rule, text):
     return nid
 
 
+RE_IN = re.compile(r"\bin\s+(\d+(?:\.\d+)?)\s*(min(?:ute)?s?|h|hrs?|hours?)\b", re.I)
+
+
 def handle_remind(st, arg, ts):
     if len(st["reminders"]) >= MAX_REMINDERS or len(render(st)) > 3500:
         return f"The reminder list is full (limit {MAX_REMINDERS}). Remove some first."
+    m = RE_IN.search(arg)
+    if m:
+        amount = float(m[1]) * (60 if m[2].lower().startswith("h") else 1)
+        if not 1 <= amount <= 1440:
+            return "Try a time between 1 minute and 24 hours, like: remind in 10 minutes call mum"
+        text = (arg[:m.start()] + " " + arg[m.end():]).split()
+        while text and text[0].lower() in ("me", "to"):
+            text.pop(0)
+        body = " ".join(text).replace("|", "/").strip()
+        if not body:
+            return "What should I remind you about? Example: remind in 10 minutes call mum"
+        t_, rule, _ = after(ts, int(round(amount)), "")
+        nid = add_reminder(st, t_, rule, body)
+        return f"Reminder {nid} set for {t_} (in {int(round(amount))} min): {body} ⏰"
     rem, err = parse_reminder(arg, ts.date(), ts.hour * 60 + ts.minute)
     if err:
         return err + "\nExamples: remind 15:00 call mum | remind daily 7am drink water | remind every mon,wed 18:00 gym"
     nid = add_reminder(st, rem["time"], rem["rule"], rem["text"])
-    return f"Reminder {nid} set: {rem['time']}, {describe(rem['rule'], ts.date())}: {rem['text']} ⏰"
+    note = ""
+    if in_quiet(st, mins(rem["time"])):
+        note = f"\nNote: {rem['time']} is inside your quiet hours ({st['quiet']}), so it will arrive at {st['quiet'].split('-')[1]}. Send \"quiet off\" if you want it exactly on time."
+    return f"Reminder {nid} set: {rem['time']}, {describe(rem['rule'], ts.date())}: {rem['text']} ⏰{note}"
 
 
 def after(now, minutes_ahead, text):
-    """A one-off reminder dict `minutes_ahead` from now."""
+    """(time, rule, text) for a one-off timer `minutes_ahead` from now, rounded up to the next minute."""
     t = now + timedelta(minutes=minutes_ahead)
-    return f"{t:%H:%M}", f"once:{t.date()}", text
+    if t.second or t.microsecond:
+        t = t.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return f"{t:%H:%M}", f"soon:{t.date()}", text
+
+
+def is_once(rule):
+    return rule.startswith(("once:", "soon:"))
 
 
 # ----------------------------------------------------------- message reading
@@ -406,10 +434,10 @@ RE_READ = re.compile(r"^/?(?:read|pages?)\s+(\d+)\s*(?:pages?)?\s*$", re.I)
 RE_WATER = re.compile(r"^/?(?:water|drank|drink)\s*([+-]?\d+(?:\.\d+)?)\s*(ml|l|litres?|liters?|glass(?:es)?)?\s*$", re.I)
 RE_SET = re.compile(
     r"^/?set\s+(wake|workout|work|wakecall|midday|leavecheck|leave|review|water|pages|glass|photo|outdoor)\s*(?:to|at)?\s*(.+)$", re.I)
-RE_FOCUS = re.compile(r"^/?focus(?:\s+(\d{1,3}))?\s*(.*)$", re.I)
-RE_MOOD = re.compile(r"^/?mood(?:\s+([1-5]))?\s*$", re.I)
-RE_JOURNAL = re.compile(r"^/?journal\s*:?\s*(.+)$", re.I | re.S)
-RE_QUIET = re.compile(r"^/?quiet\s*(?:hours)?\s*(.+)$", re.I)
+RE_FOCUS = re.compile(r"^/?focus\b(?:\s+(\d{1,3}))?\s*(.*)$", re.I)
+RE_MOOD = re.compile(r"^/?mood\b(?:\s+([1-5]))?\s*$", re.I)
+RE_JOURNAL = re.compile(r"^/?journal\b\s*:?\s*(.+)$", re.I | re.S)
+RE_QUIET = re.compile(r"^/?quiet\b\s*(?:hours)?\s*(.+)$", re.I)
 RE_BUDDY = re.compile(r"^/?buddy\s+(\S+)\s*$", re.I)
 RE_RLIST = re.compile(r"^/?(?:reminders|list reminders|my reminders|show reminders)\s*$", re.I)
 RE_RREMOVE = re.compile(r"^/?(?:remove|delete|cancel|del)\s*(?:reminder\s*)?#?(\d+)\s*$", re.I)
@@ -471,7 +499,7 @@ def classify(m):
         return "setrule", (r[1].lower(), r[2].strip())
     r = RE_WATER.match(text)
     if r:
-        return "water", (float(r[1]), (r[2] or "ml").lower())
+        return "water", (float(r[1]), (r[2] or "").lower())
     r = RE_READ.match(text)
     if r:
         return "pages", int(r[1])
@@ -776,8 +804,9 @@ def run(st, updates, now):
                 pass
         if today >= START:
             st["day"] += 1
-        if today.weekday() == 0 and st["week"] != str(today):
-            st["slips"], st["week"] = 0, str(today)
+        monday = today - timedelta(days=today.weekday())
+        if st["week"] != str(monday):
+            st["slips"], st["week"] = 0, str(monday)
         st.update(today=str(today), wake_t="-", workout_t="-", work_t="-", left_t="-", sent=[],
                   water=0, pages=0, photo_t="-", outdoor_t="-", mood="-")
         if today >= START and st["notes"].startswith("TEST DAY"):
@@ -868,9 +897,12 @@ def run(st, updates, now):
             out.append("Send me your progress photo now (as a photo, not a file). 📸")
         elif kind == "water":
             val, unit = data
-            ml = val * (1000 if unit.startswith(("l", "li")) and unit != "ml" and not unit.startswith("glass") else 1)
-            if unit.startswith("glass"):
+            if unit.startswith("glass") or (unit == "" and abs(val) <= 20):
                 ml = val * g["glass"]
+            elif unit.startswith("l"):
+                ml = val * 1000
+            else:
+                ml = val
             st["water"] = max(0, st["water"] + int(ml))
             if g["water"]:
                 pct = min(100, round(100 * st["water"] / g["water"]))
@@ -986,7 +1018,7 @@ def run(st, updates, now):
         t = mins(r["time"])
         d = today
         eff = t
-        if in_quiet(st, t):
+        if in_quiet(st, t) and not r["rule"].startswith("soon:"):
             qe = mins(st["quiet"].split("-")[1])
             eff = qe
             if t >= qe:  # late-evening reminder waits for tomorrow morning
@@ -995,9 +1027,9 @@ def run(st, updates, now):
             late = " (a bit late)" if cur - eff > 10 else ""
             out.append(msg(f"⏰ Reminder: {r['text']}{late}", reminder_buttons()))
             r["last"] = str(d)
-            if r["rule"].startswith("once:"):
+            if is_once(r["rule"]):
                 continue
-        elif r["rule"].startswith("once:") and r["rule"][5:] < str(today - timedelta(days=1)):
+        elif is_once(r["rule"]) and r["rule"][5:] < str(today - timedelta(days=1)):
             continue
         keep.append(r)
     st["reminders"] = keep
@@ -1124,9 +1156,34 @@ def deliver(tg, chat, st, out):
             tg.call("setMyCommands", commands=json.dumps([{"command": c, "description": d} for c, d in BOT_COMMANDS]))
 
 
+BACKUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_backup.txt")
+
+
+def fit(st, text):
+    """Telegram messages hold 4096 characters: drop the oldest history days if the tracker grows too long."""
+    while len(text) > 4000 and len(st["hist"]) > 14:
+        date_cut(st)
+        text = render(st, updated=st["updated"])
+    return text
+
+
+def date_cut(st):
+    cut = 10
+    st["hist"], st["moods"] = st["hist"][cut:], st["moods"][cut:]
+    st["hist_start"] = str(pdate(st["hist_start"]) + timedelta(days=cut))
+    return cut
+
+
 def cycle(tg, chat, dry, fake_now=None, poll=0):
     """One read-reply-save pass. With poll > 0, waits up to that many seconds for new messages."""
     mid, old_text = tg.tracker()
+    restored = False
+    if not old_text and not dry and os.path.exists(BACKUP):
+        try:
+            old_text = open(BACKUP, encoding="utf-8").read()  # the pinned message was lost: use the host's copy
+            restored = bool(old_text)
+        except OSError:
+            old_text = None
     st = parse(old_text) if old_text else new_state()
 
     r = tg.call("getUpdates", offset=st["last_id"] + 1, timeout=poll,
@@ -1151,8 +1208,13 @@ def cycle(tg, chat, dry, fake_now=None, poll=0):
             f.write(voice)
 
     base = render(st, updated=parse(old_text)["updated"] if old_text else "setup")
-    if base != (old_text or ""):
-        text = render(st, updated=now.strftime("%Y-%m-%d %H:%M"))
+    if base != (old_text or "") or (restored and not mid):
+        text = fit(st, render(st, updated=now.strftime("%Y-%m-%d %H:%M")))
+        if not dry:
+            try:
+                open(BACKUP, "w", encoding="utf-8").write(text)
+            except OSError:
+                pass
         if mid:
             res = tg.call("editMessageText", chat_id=chat, message_id=mid, text=text)
             if not res.get("ok"):
