@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Joseph's Daily Compass v2: a Telegram accountability bot. Standard library only.
+"""Joseph's Daily Compass v4: a Telegram accountability bot. Standard library only.
 
 State lives in a pinned Telegram message (the "tracker"), so nothing is stored in files.
 Settings come from environment variables or a compass.env file next to this script:
@@ -31,7 +31,7 @@ MAX_REMINDERS = 20
 HIST_KEEP = 90                     # days of history kept in the tracker
 DEFAULT_TIMES = dict(wakecall="05:00", midday="12:30", leavecheck="17:30", review="21:00", winddown="22:00")
 DEFAULT_TARGETS = dict(water=3000, pages=10, glass=500, photo=1, outdoor=1, screen=0, music=1)
-CMDVER = 4                         # bump to re-register the "/" command menu
+CMDVER = 5                         # bump to re-run the one-time clean-up (removes the old "/" command menu)
 REFLECT_AT = "23:20"               # last hourly slot of the evening Claude reflection
 WAKE_DEADLINE_AFTER = 30           # minutes after the wake-up call: "I'm awake" deadline
 WORKOUT_DEADLINE_AFTER = 90        # minutes after the wake-up call: workout video deadline
@@ -371,39 +371,163 @@ def heatmap(st, weeks=12):
     return "\n".join(rows[-weeks:])
 
 
+# ----------------------------------------------------- numbers, times, wording
+
+
+def clock(hm):
+    """'07:30' -> '7:30 am', '15:00' -> '3 pm'."""
+    h, m = [int(x) for x in hm.split(":")]
+    h12 = h % 12 or 12
+    ap = "am" if h < 12 else "pm"
+    return f"{h12} {ap}" if m == 0 else f"{h12}:{m:02d} {ap}"
+
+
+def amt(ml):
+    """Water amounts the way people say them: '500 ml', '1.5 L', '3 L'."""
+    ml = int(ml)
+    return f"{ml / 1000:g} L" if ml >= 1000 else f"{ml} ml"
+
+
+WORDNUM = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+           "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30,
+           "forty": 40, "forty five": 45, "forty-five": 45, "sixty": 60}
+SMALLWORDS = ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve")
+
+
+def parse_screen_loose(text):
+    """Screen time in minutes from natural phrasing ('about 3 and a half hours', 'three hours 20 min', '3h20'); None if unreadable."""
+    low = text.lower().replace(",", ".")
+    low = re.sub(r"\b(\d+(?:\.\d+)?)\s+and\s+a\s+half\b", lambda m: str(float(m[1]) + 0.5), low)
+    low = re.sub(r"\bhalf\s+an?\s+hour\b", "30 minutes", low)
+    low = re.sub(r"\ban?\s+hour\b", "1 hour", low)
+    for w in SMALLWORDS:
+        low = re.sub(r"\b%s\b" % w, str(WORDNUM[w]), low)
+    v = parse_screen(low.strip())
+    if v is not None:
+        return v
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hours?)\b\s*(?:and\s*)?(?:(\d+)\s*(?:m|min|mins|minutes?)?)?", low)
+    if m:
+        v = int(round(float(m[1]) * 60 + (int(m[2]) if m[2] else 0)))
+    else:
+        m = re.search(r"\b(\d{1,2}):(\d{2})\b", low)
+        if m:
+            v = int(m[1]) * 60 + int(m[2])
+        else:
+            m = re.search(r"(\d+)\s*(?:m|min|mins|minutes?)\b", low)
+            if m:
+                v = int(m[1])
+            else:
+                m = re.fullmatch(r"\D{0,12}(\d+(?:\.\d+)?)\D{0,12}", low.strip())
+                if not m:
+                    return None
+                x = float(m[1])
+                v = int(round(x * 60 if x <= 16 else x))
+    return v if 0 <= v <= 1440 else None
+
+
+def parse_duration(s):
+    """(minutes, start, end) for 'in 10 minutes', 'in an hour', 'in half an hour', 'in 2 hours'; else None."""
+    low = s.lower()
+    m = re.search(r"\bin\s+half\s+an?\s+hour\b", low)
+    if m:
+        return 30, m.start(), m.end()
+    m = re.search(r"\bin\s+(?:an?|one)\s+hour\s+and\s+a\s+half\b", low)
+    if m:
+        return 90, m.start(), m.end()
+    m = re.search(r"\bin\s+(\d+(?:\.\d+)?|an?|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty|forty[ -]five|forty|sixty)\s*"
+                  r"(min(?:ute)?s?|hours?|hrs?|h)\b", low)
+    if not m:
+        return None
+    tok = m[1]
+    n = float(tok) if tok[0].isdigit() else WORDNUM[tok]
+    if m[2].startswith("h"):
+        n *= 60
+    return int(round(n)), m.start(), m.end()
+
+
+def span_text(n):
+    if n < 60:
+        return f"{n} min"
+    if n == 60:
+        return "an hour"
+    return f"{n / 60:g} hours"
+
+
+def guess_hour(h, cur, tomorrow=False):
+    """24h hour for a bare 1-12 'o'clock': the next one that is still ahead today, or a sensible guess for another day."""
+    if h == 0 or h > 12:
+        return h % 24
+    if tomorrow:
+        return h if 7 <= h <= 11 else (h if h == 12 else h + 12)
+    cands = [h % 12, h % 12 + 12]
+    return next((c for c in cands if c * 60 > cur), cands[0])
+
+
+RE_BARE = re.compile(r"\b(?:at|by|around|for)\s+(\d{1,2})\b(?![:.]\d)(?!\s*(?:am|pm|a\.m|p\.m))", re.I)
+
+
+def find_time_bare(s, cur):
+    """'at 3' (no am/pm): pick the next sensible 3 o'clock. Returns (HH:MM, text without it) or (None, s)."""
+    m = RE_BARE.search(s)
+    if not m or int(m[1]) > 23:
+        return None, s
+    h = guess_hour(int(m[1]), cur, "tomorrow" in s.lower())
+    return f"{h:02d}:00", s[:m.start()] + " " + s[m.end():]
+
+
+def find_time_wake(text):
+    """A wake-up time from 'wake me at 6:30', '7', '6am', 'seven thirty'; None if unreadable."""
+    hm = find_time(text)[0]
+    if hm:
+        return hm
+    m = re.search(r"\b(?:at|for|to|by)?\s*(\d{1,2})\b(?!\s*[:\d])", text)
+    if m and 1 <= int(m[1]) <= 23:
+        return f"{int(m[1]):02d}:00"
+    return None
+
+
+# ----------------------------------------------------- stats and summaries
+
+
 def stats_text(st):
     today = datetime.now(TZ).date()
-    items = [c for _, c in hist_items(st) if c != "."]
-    last30 = [c for _, c in hist_items(st)][-30:]
-    last30 = [c for c in last30 if c != "."]
-    ok30 = sum(1 for c in last30 if c in "PSF")
-    pct = f"{round(100 * ok30 / len(last30))}%" if last30 else "n/a"
+    days = [c for _, c in hist_items(st)][-30:]
+    days = [c for c in days if c != "."]
+    ok30 = sum(1 for c in days if c in "PSF")
     moods = [int(c) for c in st["moods"][-7:] if c.isdigit()]
-    mood_txt = f"{sum(moods) / len(moods):.1f}/5" if moods else "n/a"
     sa = screen_avg(st, today)
-    return (f"📊 Your stats, {NAME}\n"
-            f"Day {st['day']} | Streak {st['streak']} | Best {st['best']} | Freezes {st['freezes']}/3\n"
-            f"Days finished: {len(items)} | Last 30 days: {pct} on track\n"
-            f"Mood (last 7 days): {mood_txt}\n"
-            f"Feelings (last 7 days): {emo_summary(st, today)}\n"
-            f"Screen time (7-day average): {fmt_min(sa) if sa is not None else 'n/a'}\n"
-            f"Today: water {st['water']}/{st['targets']['water']} ml, pages {st['pages']}/{st['targets']['pages']}\n"
-            f"Heatmap (🟩 perfect 🟨 slip 🟦 freeze 🟥 reset):\n{heatmap(st)}")
+    lines = [f"📊 Here's where you are, {NAME}", f"Day {st['day']} · streak {st['streak']} 🔥 · best {st['best']}"]
+    if days:
+        lines.append(f"Last 30 days: {round(100 * ok30 / len(days))}% on track")
+    if moods:
+        lines.append(f"Mood this week: {sum(moods) / len(moods):.1f}/5")
+    emo = emo_summary(st, today)
+    if emo != "none logged":
+        lines.append(f"Feelings: {emo}")
+    if sa is not None:
+        lines.append(f"Screen time: {fmt_min(sa)} a day on average")
+    lines.append(heatmap(st) if days else "No finished days yet. Day 1 is coming 💪")
+    return "\n".join(lines)
 
 
 def weekly_text(st, today):
     week = [c for d, c in hist_items(st) if today - timedelta(days=6) <= d <= today]
     p, s, f, x = (week.count(k) for k in "PSFX")
     moods = [int(c) for c in st["moods"][-7:] if c.isdigit()]
-    mood_txt = f"{sum(moods) / len(moods):.1f}/5" if moods else "n/a"
     sa = screen_avg(st, today)
-    return (f"🗓️ Weekly review, {NAME}\n"
-            f"Perfect days: {p} | Slips: {s} | Freezes used: {f} | Resets: {x}\n"
-            f"Streak {st['streak']} (best {st['best']}) | Mood avg {mood_txt}\n"
-            f"Feelings: {emo_summary(st, today)}\n"
-            f"Screen time (average): {fmt_min(sa) if sa is not None else 'n/a'}\n"
-            f"Heatmap:\n{heatmap(st, 6)}\n"
-            f"Reflect: what worked this week? Reply with /diary <one line>")
+    lines = [f"🗓️ Your week, {NAME}", f"{p} perfect · {s} slips · {f} freezes · {x} resets",
+             f"Streak {st['streak']} (best {st['best']})"]
+    if moods:
+        lines.append(f"Mood: {sum(moods) / len(moods):.1f}/5 on average")
+    emo = emo_summary(st, today)
+    if emo != "none logged":
+        lines.append(f"Feelings: {emo}")
+    if sa is not None:
+        lines.append(f"Screen time: {fmt_min(sa)} a day")
+    if hist_items(st):
+        lines.append(heatmap(st, 6))
+    lines.append("What worked this week? Tell me in a line and I'll keep it.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- reminders
@@ -428,28 +552,51 @@ def rule_matches(rule, d):
     return False
 
 
-def describe(rule, today=None):
-    if rule in ("daily", "weekdays", "weekends"):
-        return rule
+def when_text(hm, rule, today):
+    """'today at 3 pm', 'every day at 7 am', 'on Fri 06 Nov at 9 am'."""
+    t = clock(hm)
+    if rule == "daily":
+        return f"every day at {t}"
+    if rule == "weekdays":
+        return f"on weekdays at {t}"
+    if rule == "weekends":
+        return f"on weekends at {t}"
     if rule.startswith("days:"):
-        return "every " + ", ".join(x.capitalize() for x in rule[5:].split(","))
-    if rule.startswith("soon:"):
-        return "timer"
-    if rule.startswith("once:"):
-        d = rule[5:]
-        if today and d == str(today):
-            return "today only"
-        if today and d == str(today + timedelta(days=1)):
-            return "tomorrow only"
-        return f"once on {d}"
-    return rule
+        return "every " + ", ".join(x.capitalize() for x in rule[5:].split(",")) + f" at {t}"
+    d = rule[5:]
+    if d == str(today):
+        return f"today at {t}"
+    if d == str(today + timedelta(days=1)):
+        return f"tomorrow at {t}"
+    try:
+        return f"on {pdate(d).strftime('%a %d %b')} at {t}"
+    except ValueError:
+        return f"on {d} at {t}"
+
+
+def reminder_words(words):
+    words = list(words)
+    while words and words[0].lower() in ("me", "to", "at", "on", "every", "of", "that", "about", "for"):
+        words.pop(0)
+    while words and words[-1].lower() in ("on", "at", "by", "for", "to", "in", "around", "and", "then"):
+        words.pop()
+    return " ".join(words).replace("|", "/").strip()
 
 
 def parse_reminder(arg, today, cur):
     """Return (dict(time, rule, text), None) or (None, error message)."""
+    tomorrow_word = "tomorrow" in arg.lower()
     hm, rest = find_time(arg)
+    if hm:
+        m = RE_TIME.search(arg)
+        has_ampm = bool(m and (m[3] or m[5]))
+        h = int(hm[:2])
+        if not has_ampm and 1 <= h <= 12 and ":" in m.group(0):
+            hm = f"{guess_hour(h, cur, tomorrow_word):02d}:{hm[3:]}"
+    else:
+        hm, rest = find_time_bare(arg, cur)
     if not hm:
-        return None, "I need a time, like 15:00 or 3pm."
+        return None, "What time? Try \"remind me to call mum at 3pm\"."
     toks = rest.split()
     used = [False] * len(toks)
     rule = None
@@ -494,24 +641,20 @@ def parse_reminder(arg, today, cur):
             rule = f"once:{today + timedelta(days=ahead)}"
     if rule is None:
         rule = f"once:{today if mins(hm) > cur else today + timedelta(days=1)}"
-    words = [t for t, u in zip(toks, used) if not u]
-    while words and words[0].lower() in ("me", "to", "at", "on", "every", "of"):
-        words.pop(0)
-    text = " ".join(words).replace("|", "/").strip()
+    text = reminder_words(t for t, u in zip(toks, used) if not u)
     if not text:
-        return None, "What should I remind you about? Example: remind 15:00 call mum"
+        return None, "What should I remind you about?"
     if rule == f"once:{today}" and mins(hm) + 120 < cur:
-        return None, f"{hm} has already passed today. Try: remind tomorrow {hm} {text}"
+        return None, "That time has already passed today. Say \"tomorrow\" and I'll set it for then."
     return dict(time=hm, rule=rule, text=text[:60]), None
 
 
 def reminders_text(st, today):
     if not st["reminders"]:
-        return "No reminders yet. Try: remind 15:00 call mum, or remind daily 7am drink water."
-    lines = ["Your reminders:"]
+        return "Nothing set right now. Tell me what to remind you about, like \"remind me to call mum at 3pm\"."
+    lines = ["Here's what I'm keeping for you ⏰"]
     for r in sorted(st["reminders"], key=lambda r: (r["time"], r["id"])):
-        lines.append(f"{r['id']}) {r['time']}, {describe(r['rule'], today)}: {r['text']}")
-    lines.append("Remove: remove <number>. Change time: change <number> to <time>.")
+        lines.append(f"{r['id']}. {r['text']} · {when_text(r['time'], r['rule'], today)}")
     return "\n".join(lines)
 
 
@@ -521,34 +664,29 @@ def add_reminder(st, time_hm, rule, text):
     return nid
 
 
-RE_IN = re.compile(r"\bin\s+(\d+(?:\.\d+)?)\s*(min(?:ute)?s?|h|hrs?|hours?)\b", re.I)
-
-
 def handle_remind(st, arg, ts):
     if len(st["reminders"]) >= MAX_REMINDERS or len(render(st)) > 3500:
-        return f"The reminder list is full (limit {MAX_REMINDERS}). Remove some first."
-    m = RE_IN.search(arg)
-    if m:
-        amount = float(m[1]) * (60 if m[2].lower().startswith("h") else 1)
+        return "My reminder list is full. Let's clear a few first."
+    cur = ts.hour * 60 + ts.minute
+    dur = parse_duration(arg)
+    if dur:
+        amount, a, b = dur
         if not 1 <= amount <= 1440:
-            return "Try a time between 1 minute and 24 hours, like: remind in 10 minutes call mum"
-        text = (arg[:m.start()] + " " + arg[m.end():]).split()
-        while text and text[0].lower() in ("me", "to"):
-            text.pop(0)
-        body = " ".join(text).replace("|", "/").strip()
+            return "I can set anything from 1 minute to 24 hours. Try \"remind me in 10 minutes to stretch\"."
+        body = reminder_words((arg[:a] + " " + arg[b:]).split())
         if not body:
-            return "What should I remind you about? Example: remind in 10 minutes call mum"
-        t_, rule, _ = after(ts, int(round(amount)), "")
-        nid = add_reminder(st, t_, rule, body)
-        return f"Reminder {nid} set for {t_} (in {int(round(amount))} min): {body} ⏰"
-    rem, err = parse_reminder(arg, ts.date(), ts.hour * 60 + ts.minute)
+            return "What should I remind you about?"
+        t_, rule, _ = after(ts, amount, "")
+        add_reminder(st, t_, rule, body)
+        return f"Got it, I'll remind you in {span_text(amount)} ({clock(t_)}): {body[:60]} ⏰"
+    rem, err = parse_reminder(arg, ts.date(), cur)
     if err:
-        return err + "\nExamples: remind 15:00 call mum | remind daily 7am drink water | remind every mon,wed 18:00 gym"
-    nid = add_reminder(st, rem["time"], rem["rule"], rem["text"])
+        return err
+    add_reminder(st, rem["time"], rem["rule"], rem["text"])
     note = ""
     if in_quiet(st, mins(rem["time"])):
-        note = f"\nNote: {rem['time']} is inside your quiet hours ({st['quiet']}), so it will arrive at {st['quiet'].split('-')[1]}. Send \"quiet off\" if you want it exactly on time."
-    return f"Reminder {nid} set: {rem['time']}, {describe(rem['rule'], ts.date())}: {rem['text']} ⏰{note}"
+        note = f"\nThat's inside your quiet hours, so it'll arrive at {clock(st['quiet'].split('-')[1])}."
+    return f"Got it, I'll remind you {when_text(rem['time'], rem['rule'], ts.date())}: {rem['text']} ⏰{note}"
 
 
 def after(now, minutes_ahead, text):
@@ -565,53 +703,200 @@ def is_once(rule):
 
 # ----------------------------------------------------------- message reading
 
-L_AWAKE, L_VIDEO, L_WORK, L_LEAVE = "☀️ I'm awake", "🎥 Workout video", "📍 I'm at work", "🚪 Leaving work"
-L_OUTDOOR, L_PHOTO, L_FOCUS, L_MOOD = "🌳 Outdoor workout", "📸 Progress photo", "🍅 Focus 25", "😊 Mood"
-L_STATS, L_REM, L_HELP, L_WD = "📊 Stats", "⏰ Reminders", "❓ Help", "🌙 Wind-down"
-LABELS = {L_AWAKE: "awake", L_VIDEO: "hint_video", L_WORK: "atwork", L_LEAVE: "leave", L_OUTDOOR: "outdoor",
-          L_PHOTO: "hint_photo", L_FOCUS: "focus", L_MOOD: "mood", L_STATS: "stats", L_REM: "rlist", L_HELP: "help", L_WD: "wd"}
-SLASH = {"/start": "start", "/status": "status", "/help": "help", "/stats": "stats", "/menu": "menu", "/wd": "wd",
+SLASH = {"/start": "start", "/status": "status", "/help": "help", "/stats": "stats", "/menu": "help", "/wd": "wd",
          "/cancel": "cancel", "/feel": "feel", "/feelings": "feelings", "/export": "export", "/awake": "awake",
          "/atwork": "atwork", "/leaving": "leave", "/leave": "leave", "/outdoor": "outdoor", "/photo": "hint_photo",
          "/video": "hint_video", "/reminders": "rlist"}
-EXPLICIT = {"setwake", "playlist", "start", "status", "help", "stats", "menu", "wd", "cancel", "feel", "feelings", "export", "rlist", "rremove",
-            "rclear", "redit", "remind", "setrule", "quiet", "buddy", "screen", "diary_show"}
-RE_WATER_BTN = re.compile(r"^💧 \+(\d+) ?ml$")
-RE_PAGES_BTN = re.compile(r"^📖 \+(\d+) pages?$")
+# These always run, even while the bot is waiting for an answer in the wind-down.
+EXPLICIT = {"setwake", "playlist", "start", "status", "help", "stats", "cancel", "feelings", "export", "rlist", "rremove",
+            "rremove_txt", "rclear", "redit", "remind", "setrule", "quiet", "buddy", "screen", "diary_show"}
 
 RE_BOOK = [
     re.compile(r"book\s*:\s*[\"“'‘]?(.+?)[\"”'’]?\s*,\s*page\s*(\d+)", re.I),
     re.compile(r"reading\s+[\"“'‘]?(.+?)[\"”'’]?\s*,?\s*(?:on\s+)?page\s*(\d+)", re.I),
 ]
-RE_PAGE = re.compile(r"\bpage\s*(\d+)\b|\bp\.?\s*(\d+)\b", re.I)
-RE_READ = re.compile(r"^/?(?:read|pages?)\s+(\d+)\s*(?:pages?)?\s*$", re.I)
+RE_BOOK_NEW = re.compile(r"^(?:i'?m|i am)?\s*(?:now\s+)?(?:reading|started reading|starting|just started)\s+[\"“'‘]?(.{3,40}?)[\"”'’]?[.!]?$", re.I)
+RE_BAD_TITLE = re.compile(r"^(?:chapter|page|pg|now|again|more|it|this|that|something|a |an |some|my |for |to |on |at )", re.I)
+RE_PAGE_AT = re.compile(r"\b(?:on|reached|reach|at|to|now|up to|reading|finished|read|hit)\b[^.!?]{0,20}?\b(?:page|pg\.?)\s*(\d{1,4})\b|^(?:page|pg\.?)\s*(\d{1,4})\b", re.I)
 RE_WATER = re.compile(r"^/?(?:water|drank|drink)\s*([+-]?\d+(?:\.\d+)?)\s*(ml|l|litres?|liters?|glass(?:es)?)?\s*$", re.I)
+RE_READ = re.compile(r"^/?(?:read|pages)\s+(\d+)\s*(?:pages?)?\s*$", re.I)
 RE_SET = re.compile(
     r"^/?set\s+(wake|workout|work|wakecall|midday|leavecheck|leave|review|water|pages|glass|photo|outdoor|screen|music|winddown)\s*(?:to|at)?\s*(.+)$", re.I)
+RE_GOAL = re.compile(r"\b(?:change|make|set|update|raise|lower|increase|decrease)\s+(?:my\s+|the\s+)?(water|reading|pages|screen\s*time|screen)\s+(?:goal|target|limit)\s*(?:to|at)?\s*(.+)$", re.I)
+RE_GLASS = re.compile(r"\b(?:my\s+)?(?:glass|cup)\s+(?:is|holds|size is|=)\s*(?:about\s+)?(\d+)\s*ml\b", re.I)
 RE_FOCUS = re.compile(r"^/?focus\b(?:\s+(\d{1,3}))?\s*(.*)$", re.I)
+RE_FOCUS_NAT = re.compile(r"^(?:let'?s\s+|start\s+(?:a\s+)?|begin\s+|starting\s+|doing\s+)?(?:a\s+)?(?:focus|pomodoro)\b", re.I)
 RE_MOOD = re.compile(r"^/?mood\b(?:\s+([1-5]))?\s*$", re.I)
-RE_DIARY = re.compile(r"^/?(?:diary|journal)\b\s*:?\s*(.*)$", re.I | re.S)
-RE_WAKE = re.compile(r"^/?wake\s+(?:me\s+)?(?:at\s+|to\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*$", re.I)
+RE_DIARY = re.compile(r"^/?(?:diary|journal|dear diary|note to self)\b\s*[:,]?\s*(.*)$", re.I | re.S)
+RE_WAKE = re.compile(r"^/?wake\s+(?:me\s+)?(?:up\s+)?(?:at\s+|to\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*$", re.I)
+RE_SETWAKE = re.compile(r"\b(?:wake\s+me|wake[- ]?up\s+(?:call|time)|wake\s+time|alarm|get\s+me\s+up|wake\s+up\s+at|wake\s+at|get\s+up\s+at|waking\s+up\s+at)\b", re.I)
 RE_PLAYLIST = re.compile(r"^/?playlists?\b\s*(.*)$", re.I)
 RE_SCREEN = re.compile(r"^/?screen\b\s*(?:time|today|usage)?\s*(.*)$", re.I)
+RE_SCREEN_NAT = re.compile(r"\bscreen\s*time\b|\bphone\s+(?:usage|time)\b|\btime on (?:my )?phone\b|\b(?:used|on|spent)\b.{0,12}\bphone\b", re.I)
 RE_QUIET = re.compile(r"^/?quiet\b\s*(?:hours)?\s*(.+)$", re.I)
 RE_BUDDY = re.compile(r"^/?buddy\s+(\S+)\s*$", re.I)
-RE_RLIST = re.compile(r"^/?(?:reminders|list reminders|my reminders|show reminders)\s*$", re.I)
+RE_RLIST = re.compile(r"^/?(?:reminders|list reminders|my reminders|show reminders|show my reminders|what reminders do i have|any reminders)\s*\??\s*$", re.I)
 RE_RREMOVE = re.compile(r"^/?(?:remove|delete|cancel|del)\s*(?:reminder\s*)?#?(\d+)\s*$", re.I)
+RE_RREMOVE_TXT = re.compile(r"^(?:cancel|remove|delete|forget|drop)\s+(?:the\s+|my\s+)?(?:reminder|alarm)(?:\s+(?:about|for|to))?\s+(.+)$", re.I)
 RE_RCLEAR = re.compile(r"^/?(?:clear|remove all|delete all)\s*(?:all\s*)?reminders\s*$", re.I)
 RE_REDIT = re.compile(r"^/?(?:change|edit|move|reschedule)\s*(?:reminder\s*)?#?(\d+)\s*(?:to|at)?\s*(.+)$", re.I)
 RE_REMIND = re.compile(r"^/?remind\b[\s:,]*(?:me\b[\s,]*)?(?:to\b[\s,]*)?(.*)$", re.I | re.S)
+RE_POLITE = re.compile(r"^(?:hey|hi|hello|ok|okay|so|um|uh|please|pls|plz|kindly|can you|could you|would you|will you|go ahead and|i want you to|i need you to|i'?d like you to|i would like you to)[\s,!]+", re.I)
+RE_SETREM = re.compile(r"^(?:set\s+(?:me\s+)?(?:up\s+)?(?:a\s+|an\s+)?reminder\s*(?:for|to|about|that)?\s*|reminder\s*[:\-,]\s*|add\s+(?:a\s+)?reminder\s*(?:for|to|about)?\s*|don'?t\s+let\s+me\s+forget\s+(?:to\s+)?|make\s+sure\s+i\s+(?:remember\s+to\s+)?)", re.I)
 RE_LEAVE = re.compile(
-    r"leaving early|left early|leaving work|left work|off work|knock(?:ed|ing) off|done (?:with )?work|finished work|got off work|leaving the office|left the office",
-    re.I)
+    r"leaving early|left early|leaving work|left work|off work|knock(?:ed|ing) off|done (?:with )?work|finished work|got off work|leaving the office|left the office|heading home|on my way home|clocking out|clocked out", re.I)
 RE_WORK = re.compile(
-    r"\bat work\b|\bat the office\b|\b(?:reached|arrived|got to|made it to)\s+(?:the\s+)?(?:work|office)\b|\bin the office\b", re.I)
+    r"\bat work\b|\bat the office\b|\b(?:reached|arrived|got to|made it to|got into)\s+(?:the\s+|my\s+)?(?:work|office|desk)\b|\bin the office\b|\bat my desk\b", re.I)
 RE_AWAKE = re.compile(
-    r"\bawake\b|\bwoke\b|\bwaking\b|\bwake(?:n)? up\b|\bi'?m up\b|\bim up\b|\bup now\b|\bam up\b|\bgood morning\b|^up\b", re.I)
+    r"\bawake\b|\bwoke\b|\bwaking\b|\bwake(?:n)? up\b|\bi'?m up\b(?!\s+(?:to|for|against|with|in|on)\b)|\bim up\b(?!\s+(?:to|for|against|with|in|on)\b)|\bup now\b|\bam up\b(?!\s+(?:to|for|against|with|in|on)\b)|\bup and (?:ready|about|awake)\b|\bgood morning\b|^(?:morning|gm)\b|^up\b", re.I)
 RE_OUTDOOR = re.compile(r"\b(outdoor|outdoors|outside)\b", re.I)
+RE_OUT_SURE = re.compile(r"\b(?:outdoor|outside)\s+(?:workout|exercise|run|session|training)|\b(?:went|go)\s+(?:for\s+)?(?:a\s+)?(?:run|jog|hike)\b|\b(?:ran|jogged|hiked)\b|\bdid my outdoor\b", re.I)
+RE_OUT_MAYBE = re.compile(r"\b(?:went|go)\s+(?:for\s+)?(?:a\s+)?walk\b|\bwalked\b|\bcycled\b|\bbike ride\b|\bwent cycling\b", re.I)
+RE_WD = re.compile(r"\bwind(?:ing|s)?[\s-]*down\b|\bgood\s*night\b|\bnight\s*night\b|\bnighty\s*night\b|\bcalling\s+it\s+a\s+night\b|"
+                   r"\b(?:going|heading|off|ready|time)\s+(?:to|for)\s+(?:bed|sleep)\b|\bhitting\s+the\s+sack\b|\bturning\s+in\b|^gn\b", re.I)
+RE_STATUS = re.compile(r"\bhow\s+am\s+i\s+doing\b|\bhow'?s\s+my\s+day\b|\bhow\s+is\s+my\s+day\b|\bwhat'?s\s+(?:still\s+)?(?:left|open|pending|remaining)\b|"
+                       r"\bwhat\s+(?:do\s+i\s+have|have\s+i\s+got)\s+left\b|\bwhat\s+(?:is|are)\s+left\b|\bmy\s+(?:progress|streak)\b|"
+                       r"\bwhere\s+(?:am\s+i|do\s+i\s+stand)\b|^(?:status|progress|update)\s*\??$", re.I)
+RE_STATS = re.compile(r"\bmy\s+stats\b|^stats$|\bheat\s*map\b|\bhow\s+was\s+my\s+week\b|\bhow\s+have\s+i\s+been\s+doing\b", re.I)
+RE_HELPQ = re.compile(r"\bwhat\s+can\s+you\s+do\b|\bhow\s+does\s+this\s+work\b|\bwhat\s+can\s+i\s+(?:say|send|do)\b|^help\b|\bhow\s+do\s+i\s+use\b", re.I)
+RE_DIARY_SHOW = re.compile(r"\b(?:show|read|see|open|view|check)\s+(?:me\s+)?(?:my\s+|the\s+|today'?s\s+)?(?:diary|journal)\b|\bwhat\s+did\s+i\s+write\b", re.I)
+RE_EXPORT = re.compile(r"\b(?:send|export|give)\s+(?:me\s+)?(?:my\s+|the\s+)?(?:whole\s+|full\s+)?(?:diary|journal)\b", re.I)
+RE_FEELINGS_LOG = re.compile(r"\bfeelings?\s+(?:log|history)\b|\bhow\s+have\s+i\s+been\s+feeling\b", re.I)
+RE_THANKS = re.compile(r"^(?:thanks|thank you|thx|ty|cheers|appreciate it|much appreciated)\b", re.I)
+RE_GREET = re.compile(r"^(?:hi|hello|hey|yo|hola|howdy|sup)\b[\s!.,]*(?:there|joseph|bot|compass|buddy)?[\s!.]*$", re.I)
+RE_OKAY = re.compile(r"^(?:ok(?:ay)?|k|kk|cool|nice|great|alright|sure|yes|yeah|yep|yup|noted|got it|lol|haha|😂|👍|🙏|❤️|🔥|💪)[\s!.]*$", re.I)
+RE_QUESTION = re.compile(r"^(?:what|why|how|when|where|who|which|can|could|should|would|is|are|do|does|did|will|am|may)\b", re.I)
+RE_HYPO = re.compile(
+    r"\b(?:will|won'?t|shall|gonna|going\s+to|should|shouldn'?t|need\s+to|needs\s+to|have\s+to|has\s+to|must|want\s+to|wanna|might|maybe|"
+    r"later|tomorrow|soon|if\s+i|when\s+i|whether|can\s+i|could\s+i|do\s+i|did\s+i|how\s+much|how\s+many|how\s+do|supposed\s+to|"
+    r"plan\s+to|planning\s+to|about\s+to|trying\s+to|try\s+to|i'?ll|would\s+like|let'?s)\b|\?\s*$", re.I)
+RE_WATER_VERB = re.compile(r"\b(?:drank|drunk|drink|drinking|had|finished|finish|downed|sipped|got\s+through|polished\s+off|done\s+with|chugged|gulped|another|more)\b", re.I)
+RE_OTHER_DRINK = re.compile(r"\b(?:juice|tea|coffee|milk|soda|coke|beer|wine|smoothie|chai|energy\s+drink|soup|porridge|latte)\b", re.I)
+
+EMO_MAP = {}
+for _e, _ws in {"good": "happy great amazing awesome grateful excited motivated hopeful proud joyful cheerful energized energised wonderful blessed fantastic positive thankful",
+                "calm": "calm peaceful relaxed content relieved settled chill serene",
+                "stressed": "stressed anxious overwhelmed worried nervous tense pressured panicked scared afraid uneasy",
+                "low": "sad low down lonely discouraged depressed unmotivated empty hopeless heavy gloomy",
+                "frustrated": "angry frustrated annoyed irritated upset mad furious bitter resentful",
+                "tired": "tired exhausted drained sleepy burnt burned fatigued wiped spent"}.items():
+    for _w in _ws.split():
+        EMO_MAP[_w] = _e
+WEAK_EMO = {"good": "good", "fine": "calm", "okay": "calm", "ok": "calm", "alright": "calm", "well": "good", "better": "good", "meh": "low"}
+RE_FEEL = re.compile(r"\b(?:i\s*am\s+feeling|i'?m\s+feeling|i\s+am|i'?m|im|i\s+feel|i\s+have\s+been|i'?ve\s+been|been\s+feeling|feeling|feel)\s+"
+                     r"((?:(?:so|really|very|quite|a\s+bit|a\s+little|kinda|kind\s+of|pretty|super|extremely|rather|totally|just|feeling)\s+)*)([a-z]+)", re.I)
+RE_WHY = re.compile(r"\W*(?:because|cause|cos|since|about|over|due\s+to|from|after|with)\s+(.+)$", re.I | re.S)
 
 
-def classify(m):
+def read_feeling(text):
+    """(emotion, why or None) when the message says how Joseph feels ('I'm so stressed about work'), else None."""
+    low = text.lower()
+    for m in RE_FEEL.finditer(low):
+        word = m[2]
+        explicit = "feel" in m[0]
+        emo = EMO_MAP.get(word) or (WEAK_EMO.get(word) if explicit else None)
+        if emo:
+            w = RE_WHY.match(text[m.end():])
+            return emo, (w[1].strip() if w else None)
+    return None
+
+
+def emotion_from(text):
+    """Pick an emotion from whatever he typed in the wind-down: 'stressed', 'a bit anxious about work', 'mixed'."""
+    fe = read_feeling(text)
+    if fe:
+        return fe
+    words = re.findall(r"[a-z]+", text.lower())
+    for w in words:
+        if w in EMO_MAP:
+            return EMO_MAP[w], (text.strip() if len(words) > 2 else None)
+    if len(words) <= 2:
+        w = words[0] if words else "other"
+        return WEAK_EMO.get(w, "_".join(words) or "other"), None
+    return "other", text.strip()
+
+
+def clauses(low):
+    return [c.strip() for c in re.split(r"[,;!]|\.(?!\d)| and | but | then | also ", low) if c.strip()]
+
+
+def parse_water(text, glass):
+    """(millilitres, sure) for a plain-language water message ('had a glass of water', 'two bottles', '1.5 litres'), or None."""
+    low = text.lower().strip()
+    if RE_HYPO.search(low):
+        return None
+    has_water = bool(re.search(r"\bwater\b|hydrat", low))
+    verb = bool(RE_WATER_VERB.search(low))
+    if low in ("water", "a glass of water"):
+        return glass, True
+    if RE_OTHER_DRINK.search(low) and not has_water:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(ml|millilit\w*|l|lit(?:re|er)s?|ltrs?)\b", low)
+    if m and (has_water or verb or len(low.split()) <= 2):
+        v = float(m[1])
+        return int(v if m[2].startswith("m") else v * 1000), True
+    m = re.search(r"\b(half\s+a|half|a|one|an)\s+lit(?:re|er)\b", low)
+    if m and (has_water or verb):
+        return (500 if m[1].startswith("half") else 1000), True
+    m = re.search(r"\b(glass(?:es)?|cups?|mugs?|bottles?|jugs?|pitchers?)\b", low)
+    if m and (has_water or verb):
+        g = m[1]
+        unit = glass if g.startswith("glass") else 250 if g.startswith("cup") else 300 if g.startswith("mug") else 500 if g.startswith("bottle") else 1000
+        before = low[:m.start()]
+        qty = 1.0
+        if re.search(r"half\s+(?:of\s+)?(?:an?\s+|the\s+|my\s+)?(?:\w+\s+)?$", before):
+            qty = 0.5
+        else:
+            for tok in reversed(before.split()[-3:]):
+                if tok in ("couple",):
+                    qty = 2.0
+                    break
+                if tok == "few":
+                    qty = 3.0
+                    break
+                v = float(tok) if re.fullmatch(r"\d+(?:\.\d+)?", tok) else WORDNUM.get(tok)
+                if v:
+                    qty = float(v)
+                    break
+        if re.search(r"\b(?:or two|or 2)\b", low[m.end():]):
+            qty = 2.0
+        return int(unit * qty), True
+    if has_water and verb:
+        return glass, False
+    if has_water and re.search(r"\b(?:some|sip|sipped|little|bit)\b", low):
+        return 250, False
+    return None
+
+
+def parse_pages(low):
+    """('n', pages, sure), ('ask',) or None for a plain-language reading message."""
+    if RE_HYPO.search(low):
+        return None
+    m = re.search(r"\b(?:read|reading|finished|did|done|completed|got through|managed|knocked out)\b[^.!?]*?\b(\d{1,4})\s+pages?\b", low)
+    if m:
+        return ("n", int(m[1]), True)
+    if re.search(r"\b(?:read|reading)\b[^.!?]*\b(?:a\s+couple(?:\s+of)?|couple\s+of|a\s+few|some)\s+pages?\b", low):
+        return ("n", 2 if "couple" in low else 5, False)
+    m = re.search(r"\b(?:read|reading|studied)\b[^.!?]*?\b(\d{1,3})\s*(min(?:ute)?s?|hours?|hrs?)\b", low)
+    if m:
+        minutes = int(m[1]) * (60 if m[2].startswith("h") else 1)
+        return ("n", max(1, minutes // 2), False)
+    if re.search(r"\b(?:finished|read|completed|done with)\b[^.!?]*\b(?:chapters?|the book|my book)\b", low):
+        return ("ask",)
+    return None
+
+
+def norm(t):
+    t = t.strip()
+    for _ in range(4):
+        n = RE_POLITE.sub("", t, count=1)
+        if n == t:
+            break
+        t = n
+    return RE_SETREM.sub("remind me to ", t, count=1).strip()
+
+
+def classify(m, glass=500):
     """Return (kind, data) for one Telegram message."""
     doc = m.get("document") or {}
     mime = str(doc.get("mime_type", ""))
@@ -620,26 +905,31 @@ def classify(m):
         return ("outdoor" if RE_OUTDOOR.search(caption) else "workout"), None
     if "photo" in m or mime.startswith("image"):
         return "photo", None
-    text = re.sub(r"^(/\w+)@\w+", r"\1", (m.get("text") or caption).strip())
+    if "voice" in m or "audio" in m:
+        return "voice", None
+    raw = (m.get("text") or caption or "").strip()
+    if not raw:
+        return "sticker", None
+    text = re.sub(r"^(/\w+)@\w+", r"\1", raw).replace("\u2019", "'").replace("\u2018", "'")
     low = text.lower()
     if low in SLASH:
         return SLASH[low], None
     if low == "/water":
-        return "water", (1.0, "glass")
+        return "water", (glass, True)
     if low == "/pages":
-        return "pages", 5
-    if low in ("status", "help"):
-        return low, None
-    if text in LABELS:
-        return LABELS[text], None
-    r = RE_WATER_BTN.match(text)
-    if r:
-        return "water", (float(r[1]), "ml")
-    r = RE_PAGES_BTN.match(text)
-    if r:
-        return "pages", int(r[1])
-    if low in ("/stats", "stats"):
-        return "stats", None
+        return "pages", (5, True)
+    if low in ("status", "help", "menu", "stats"):
+        return {"menu": "help"}.get(low, low), None
+    if RE_THANKS.match(low):
+        return "chat", "thanks"
+    if RE_GREET.match(low):
+        return "chat", "greet"
+    if RE_OKAY.match(low):
+        return "chat", "ok"
+
+    text = norm(text)
+    low = text.lower()
+    # typed forms (still understood, just never advertised)
     if RE_RLIST.match(text):
         return "rlist", None
     if RE_RCLEAR.match(text):
@@ -647,6 +937,9 @@ def classify(m):
     r = RE_RREMOVE.match(text)
     if r:
         return "rremove", int(r[1])
+    r = RE_RREMOVE_TXT.match(text)
+    if r:
+        return "rremove_txt", r[1].strip()
     r = RE_REDIT.match(text)
     if r:
         return "redit", (int(r[1]), r[2].strip())
@@ -658,12 +951,19 @@ def classify(m):
         return "setrule", (r[1].lower(), r[2].strip())
     r = RE_WATER.match(text)
     if r:
-        return "water", (float(r[1]), (r[2] or "").lower())
+        val, unit = float(r[1]), (r[2] or "").lower()
+        if unit.startswith("glass") or (unit == "" and abs(val) <= 20):
+            ml = val * glass
+        elif unit.startswith("l"):
+            ml = val * 1000
+        else:
+            ml = val
+        return "water", (int(ml), True)
     r = RE_READ.match(text)
     if r:
-        return "pages", int(r[1])
+        return "pages", (int(r[1]), True)
     r = RE_FOCUS.match(text)
-    if r:
+    if r and not RE_FOCUS_NAT.match(text) or (r and r[1]):
         return "focus", (int(r[1]) if r[1] else 25, r[2].strip())
     r = RE_MOOD.match(text)
     if r:
@@ -678,10 +978,10 @@ def classify(m):
         return "journal", arg
     r = RE_SCREEN.match(text)
     if r:
-        return "screen", r[1].strip()
+        return "screen", (parse_screen_loose(r[1]) if r[1] else None)
     r = RE_WAKE.match(text)
     if r:
-        hm = find_time(r[1] if (":" in r[1] or "m" in r[1].lower()) else r[1] + ":00")[0]
+        hm = find_time_wake(r[1])
         return ("setwake", hm) if hm else ("other", text)
     r = RE_PLAYLIST.match(text)
     if r:
@@ -696,75 +996,152 @@ def classify(m):
         r = rx.search(text)
         if r:
             return "book", (r[1].strip(), r[2])
-    if RE_LEAVE.search(text):
-        return "leave", None
-    if RE_WORK.search(text):
-        return "atwork", None
-    r = RE_PAGE.search(text)
+
+    # plain language
+    asking = low.endswith("?")
+    if RE_WD.search(low) and not asking:
+        return "wd", None
+    if RE_STATUS.search(low):
+        return "status", None
+    if RE_STATS.search(low):
+        return "stats", None
+    if RE_HELPQ.search(low):
+        return "help", None
+    if RE_RLIST.match(low.rstrip("?! ")):
+        return "rlist", None
+    if RE_EXPORT.search(low):
+        return "export", None
+    if RE_DIARY_SHOW.search(low):
+        return "diary_show", None
+    if RE_FEELINGS_LOG.search(low):
+        return "feelings", None
+    if RE_SETWAKE.search(low) and not asking:
+        hm = find_time_wake(text)
+        if hm:
+            return "setwake", hm
+    r = RE_GOAL.search(text)
     if r:
-        return "page", r[1] or r[2]
-    if RE_AWAKE.search(text):
-        return "awake", None
+        key = {"reading": "pages", "screen time": "screen", "screentime": "screen"}.get(r[1].lower().replace("  ", " "), r[1].lower())
+        return "setrule", (key, r[2].strip())
+    r = RE_GLASS.search(text)
+    if r:
+        return "setrule", ("glass", r[1])
+    if "timer" in low:
+        t = re.search(r"(\d+(?:\.\d+)?)\s*(min\w*|hours?|hrs?)", low)
+        if t:
+            return "remind", f"in {t[1]} {t[2]} Time's up ⏱"
+    if RE_FOCUS_NAT.match(low):
+        t = re.search(r"(\d{1,3})\s*(min\w*|m\b|hours?|h\b)", low)
+        minutes = (int(t[1]) * (60 if t[2].startswith("h") else 1)) if t else 25
+        label = re.sub(r"(\d{1,3})\s*(min\w*|m\b|hours?|h\b)", " ", RE_FOCUS_NAT.sub("", low, count=1))
+        label = re.sub(r"^\s*(?:session|timer|for|on|of)\b\s*", "", label.strip()).strip()
+        return "focus", (minutes, label)
+    if RE_SCREEN_NAT.search(low) and not asking:
+        v = parse_screen_loose(text)
+        if v is not None:
+            return "screen", v
+
+    cl = clauses(low)
+
+    def said(rx):
+        return any(rx.search(c) and not RE_HYPO.search(c) for c in cl)
+
+    if said(re.compile(r"\bbook\b")) or low.startswith(("i'm reading", "im reading", "i am reading", "reading ", "started reading", "just started")):
+        r = RE_BOOK_NEW.match(text.strip())
+        if r and r[1][:1].isupper() and not RE_BAD_TITLE.match(r[1]):
+            return "book_new", r[1].strip()
+    acts = []  # one message can hold several things: "I'm at work, drank a glass of water"
+    if said(RE_AWAKE):
+        acts.append(("awake", None))
+    if said(RE_WORK):
+        acts.append(("atwork", None))
+    if said(RE_LEAVE):
+        acts.append(("leave", None))
+    if said(RE_OUT_SURE):
+        acts.append(("outdoor", None))
+    elif said(RE_OUT_MAYBE):
+        acts.append(("outdoor_ask", None))
+    got_pages = False
+    for c in cl:
+        rp = parse_pages(c)
+        if rp:
+            acts.append(("pages", (rp[1], rp[2])) if rp[0] == "n" else ("pages_ask", None))
+            got_pages = True
+            break
+    if not got_pages:
+        for c in cl:
+            r = RE_PAGE_AT.search(c)
+            if r and not RE_HYPO.search(c):
+                acts.append(("page", int(r[1] or r[2])))
+                break
+    for c in cl:
+        w = parse_water(c, glass)
+        if w:
+            acts.append(("water", w))
+            break
+    fe = read_feeling(text)
+    if fe and acts:
+        acts.append(("feel", fe))
+    if len(acts) == 1:
+        return acts[0]
+    if acts:
+        return "multi", acts
+    fe = read_feeling(text)
+    if fe:
+        return "feel", fe
+    if asking or RE_QUESTION.match(low):
+        return "question", None
     return "other", text
 
 
 # ----------------------------------------------------------------- templates
 
 
-def ack(t, deadline, test, seed):
+def ack(t, deadline, test, seed, what="up"):
     diff = mins(t) - mins(deadline)
-    suffix = " (test day, nothing counts)" if test else ""
+    c, dl = clock(t), clock(deadline)
     if diff <= 0:
-        base = pick(seed, [
-            f"On time, {NAME}. 💪 Logged at {t}.",
-            f"Logged at {t}, right on time. Strong start, {NAME}.",
-            f"{t}, on time. That's how it's done, {NAME}.",
-        ])
+        options = {
+            "up": [f"Up at {c} ✅", f"Morning! Logged you up at {c} ✅", f"{c}, right on time 💪"],
+            "workout": [f"Workout video in, {c} ✅ Strong.", f"Got your workout at {c} 🎥 Nice work.", f"{c} workout, on time 💪"],
+            "work": [f"At work, {c} ✅", f"Logged you at work at {c} ✅", f"{c}, right on time. Have a good one 💪"],
+        }[what]
     else:
-        base = pick(seed, [
-            f"Logged at {t}, {diff} min past the {deadline} deadline. Let's beat it tomorrow, {NAME}.",
-            f"Got it at {t}. That's {diff} min late. Tighten it up next time, {NAME}.",
-        ])
-    return base + suffix
+        options = [f"Logged at {c} ✅ That's {diff} min past {dl}. We'll beat it tomorrow.",
+                   f"Got it, {c}. {diff} min after {dl}. Tomorrow we tighten it up."]
+    return pick(seed, options) + (" (test day)" if test else "")
 
 
 def early_leave_plan(st, t):
     end = tm(st, "review") or 21 * 60
     hrs = max(end - mins(t), 0) / 60
     book, page = st["book"], st["page"]
-    if book == "not set":
-        read = "1. Read for 30-45 minutes. Tell me your book with: book: <title>, page <n>"
-    else:
-        block = 60 if hrs >= 4 else 40 if hrs >= 2 else 25
-        read = f"1. Read {block} minutes of {book}, continuing from page {page} (tap 🍅 Focus 25 to time it)"
+    block = 60 if hrs >= 4 else 40 if hrs >= 2 else 25
+    read = f"• Read for {block} minutes" + ("" if book == "not set" else f" of {book}" + (f" from page {page}" if page.isdigit() else ""))
     pending = []
     g = st["targets"]
     if g["water"] and st["water"] < g["water"]:
-        pending.append(f"💧 water {st['water']}/{g['water']} ml")
+        pending.append(f"💧 {amt(st['water'])} of {amt(g['water'])}")
     if g["pages"] and st["pages"] < g["pages"]:
-        pending.append(f"📖 pages {st['pages']}/{g['pages']}")
+        pending.append(f"📖 {st['pages']} of {g['pages']} pages")
     if g["outdoor"] and st["outdoor_t"] == "-":
         pending.append("🌳 outdoor workout")
     if g["photo"] and st["photo_t"] == "-":
-        pending.append("📸 progress photo")
-    lines = [f"You're out early, {NAME}. About {hrs:.0f} hours of free time before tonight. Use it well:", read,
-             "2. A 20-minute walk or a stretch session", "3. Plan tomorrow: three things that must happen",
-             "4. Drink water and eat a proper meal"]
+        pending.append("📸 photo")
+    lines = [f"You're out early, {NAME} 🙌 That's about {hrs:.0f} hours before tonight. Some ideas:", read,
+             "• A 20-minute walk or a stretch", "• Write down tomorrow's top three"]
     if pending:
         lines.append("Still open today: " + ", ".join(pending))
-    lines.append("Text me the page you reach.")
     return "\n".join(lines)
 
 
 def wake_call(st):
-    text = pick(f"{st['today']}wc", [
-        f"Good morning, {NAME}! ☀️ Day {st['day']}.\nToday: text me you're up by {st['wake']}, send your workout video by {st['workout']}, and text me when you're at work by {st['work']}.\nLet's go.",
-        f"Rise and shine, {NAME}. Day {st['day']} is yours. 💪\nUp by {st['wake']}. Workout video by {st['workout']}. At work by {st['work']}.",
-    ])
+    head = pick(f"{st['today']}wc", [f"Good morning, {NAME} ☀️ Day {st['day']}.", f"Good morning, {NAME} 💪 Day {st['day']} is yours."])
+    text = head + f"\nUp by {clock(st['wake'])}, workout by {clock(st['workout'])}, at work by {clock(st['work'])}."
     g = st["targets"]
     extra = []
     if g["water"]:
-        extra.append(f"💧 {g['water']} ml water")
+        extra.append(f"💧 {amt(g['water'])} of water")
     if g["pages"]:
         extra.append(f"📖 {g['pages']} pages")
     if g["outdoor"]:
@@ -772,10 +1149,7 @@ def wake_call(st):
     if g["photo"]:
         extra.append("📸 a progress photo")
     if extra:
-        text += "\nAlso today: " + ", ".join(extra) + "."
-    if st["targets"]["music"]:
-        link = PLAYLISTS.get("wake")
-        text += "\n🎧 WAKEUP" + (f" {link}" if link else "")
+        text += "\nToday also: " + ", ".join(extra) + "."
     voice = (f"Good morning, {NAME}. Day {st['day']}. Text me when you're up by {spoken(st['wake'])}, "
              f"then get your workout done. You've got this.")
     return text, voice
@@ -783,46 +1157,52 @@ def wake_call(st):
 
 def welcome_text(st, today):
     when = "Day 1 starts on " + START.strftime("%d %B") + "." if today < START else "You're on the clock. Let's go."
-    return (f"👋 Welcome, {NAME}! Your Daily Compass is on.\n{when}\n\n"
-            "How it works:\n"
-            "• Type / to see every command, or send /menu for tap buttons.\n"
-            "• 🎥 videos count as your workout, 📸 photos as your progress photo.\n"
-            "• /wd starts your evening wind-down: screen time, how you feel and why, your diary and tomorrow's wake-up time.\n"
-            "• Add reminders by typing, for example: remind daily 7am drink water\n"
-            "• Send /help any time for everything I understand.")
+    return (f"Hi {NAME} 👋 I'm your Compass. {when}\n"
+            "Just talk to me like a friend: \"I'm up\", \"had a glass of water\", \"read 10 pages\", "
+            "\"remind me to call mum at 3\". A video counts as your workout and a photo as your progress shot.")
 
 
 def help_text():
-    return (
-        f"Here's what I understand, {NAME}. Type / to see the command menu; /menu shows tap buttons.\n"
-        "CHECK-INS\n• /awake or \"I'm awake\" • a 🎥 video • /atwork • /leaving\n"
-        "• /outdoor, or a video with 'outdoor' in the caption • a 📸 photo = progress photo\n"
-        "TASKS\n• /water 500 (or water -250, water 1 l) • /pages 10 or read to page 80\n"
-        "• book: <title>, page <n>\n"
-        "EVENING\n• /wd wind-down: screen time, feelings + why, diary, tomorrow's wake-up time • screen 3h20 • /feel (quick check-in)\n"
-        "• /wake 6:30 (set tomorrow's wake-up call) • playlist wake <spotify link> (also stressed, low, tired, frustrated, calm, good, focus)\n"
-        "• /diary (read today) | /diary 2026-11-05 | /diary <write an entry> • /feelings • /export (diary file)\n"
-        "• /cancel stops a question I'm waiting on\n"
-        "REMINDERS\n• remind 15:00 call mum • remind daily 7am drink water • remind in 10 minutes stretch\n"
-        "• remind every mon,wed 18:00 gym • reminders | remove 2 | change 2 to 4:30pm | clear reminders\n"
-        "• quiet 22:30-05:00 | quiet off\n"
-        "FOCUS, MOOD\n• focus 25 | mood 4\n"
-        "STATS\n• /stats | /status | buddy <chat id> | buddy off\n"
-        "SETTINGS\n• set wake 05:45 (also workout, work, wakecall, midday, leavecheck, review; add off to disable)\n"
-        "• set water 3000 | set pages 10 | set glass 250 | set photo off | set outdoor off | set screen 3h (daily limit) | set screen off\n"
-        "• set music off (no wake-up marker or music suggestions) | set winddown 22:00 (when I invite you to /wd)"
-    )
+    return ("Just talk to me 😊 Some examples:\n"
+            "• \"I'm up\", \"at work\", \"leaving work\"\n"
+            "• \"had a glass of water\", \"read 15 pages\", \"went for a run\"\n"
+            "• \"remind me to call mum at 3\" or \"in 20 minutes\"\n"
+            "• \"I'm feeling stressed\" or \"winding down\"\n"
+            "• \"how am I doing?\"\n"
+            "A video is your workout and a photo is your progress shot.")
 
 
-def status_text(st):  # noqa
+def status_text(st):
     g = st["targets"]
-    return (f"Day {st['day']} | Streak {st['streak']} (best {st['best']}) | Slips this week {st['slips']}/{st['free']} free | Freezes {st['freezes']}\n"
-            f"Today: wake {st['wake_t']}, workout {st['workout_t']}, work {st['work_t']}\n"
-            f"Tasks: water {st['water']}/{g['water']} ml, pages {st['pages']}/{g['pages']}, "
-            f"outdoor {st['outdoor_t']}, photo {st['photo_t']}\n"
-            f"Book: {st['book']}, page {st['page']}\n"
-            f"Deadlines: wake {st['wake']}, workout {st['workout']}, work {st['work']}\n"
-            f"Reminders: {len(st['reminders'])}")
+    done, todo = [], []
+    if st["wake_t"] != "-":
+        done.append(f"up at {clock(st['wake_t'])}")
+    else:
+        todo.append("tell me you're up")
+    if st["workout_t"] != "-":
+        done.append(f"workout at {clock(st['workout_t'])}")
+    else:
+        todo.append(f"workout video (by {clock(st['workout'])})")
+    if st["work_t"] != "-":
+        done.append(f"at work at {clock(st['work_t'])}")
+    else:
+        todo.append(f"get to work (by {clock(st['work'])})")
+    if g["water"]:
+        (done if st["water"] >= g["water"] else todo).append(
+            "water" if st["water"] >= g["water"] else f"💧 {amt(g['water'] - st['water'])} more water")
+    if g["pages"]:
+        (done if st["pages"] >= g["pages"] else todo).append(
+            "reading" if st["pages"] >= g["pages"] else f"📖 {g['pages'] - st['pages']} more pages")
+    if g["outdoor"]:
+        (done if st["outdoor_t"] != "-" else todo).append("outdoor workout")
+    if g["photo"]:
+        (done if st["photo_t"] != "-" else todo).append("progress photo")
+    lines = [f"Day {st['day']} · streak {st['streak']} 🔥"]
+    lines.append("Done: " + ", ".join(done) if done else "Nothing logged yet.")
+    lines.append("Still to do: " + ", ".join(todo) if todo else "That's everything for today 🎉")
+    if st["slips"]:
+        lines.append(f"Slips this week: {st['slips']} ({st['free']} free)")
+    return "\n".join(lines)
 
 
 def apply_setrule(st, key, val):
@@ -833,75 +1213,47 @@ def apply_setrule(st, key, val):
     if key == "screen":
         if off:
             st["targets"]["screen"] = 0
-            return "Done. The screen-time limit is off."
-        v = parse_screen(val)
+            return "Done, no screen-time limit now."
+        v = parse_screen_loose(val)
         if not v:
-            return "Try: set screen 3h (a daily limit), or set screen off"
+            return "Tell me the limit like 3h, or say off."
         st["targets"]["screen"] = v
-        return f"Done. Your daily screen-time limit is {fmt_min(v)}. Log it in /wd or with: screen 3h20. Going over, or not logging it, counts as a miss."
+        return f"Done, your daily screen-time limit is {fmt_min(v)}. Going over it, or not logging it, counts as a miss."
     if key in ("water", "pages", "glass"):
         n = re.search(r"\d+(?:\.\d+)?", low)
         if off and key != "glass":
             st["targets"][key] = 0
-            return f"Done. The {key} goal is off, so it no longer counts toward your day."
+            return f"Okay, the {key} goal is off."
         if not n:
-            return f"Try: set {key} {DEFAULT_TARGETS[key]}"
+            return "I didn't catch the number. Try again?"
         v = float(n[0])
         if key == "water" and v <= 10:
             v *= 1000  # litres
         if v < 1 or v > 20000:
-            return "That number looks off. Try again."
+            return "That number looks off. Try again?"
         st["targets"][key] = int(v)
-        return f"Done. Your {key} {'goal' if key != 'glass' else 'button size'} is now {int(v)}{' ml' if key in ('water', 'glass') else ' pages'}."
+        if key == "pages":
+            return f"Done, your reading goal is {int(v)} pages."
+        return f"Done, your water goal is {amt(v)}." if key == "water" else f"Done, a glass is {amt(v)} now."
     if key in ("photo", "outdoor", "music"):
         if not (on or off):
-            return f"Try: set {key} on  or  set {key} off"
+            return "Say on or off?"
         st["targets"][key] = int(on)
-        what = "Music suggestions and the wake-up music marker are" if key == "music" else f"The {key} task is"
-        return f"Done. {what} now {'on' if on else 'off'}."
+        what = "music suggestions" if key == "music" else f"the {key} task"
+        return f"Done, {what} {'on' if on else 'off'}."
     hm = None if off else find_time(val)[0]
     if key in ("wake", "workout", "work"):
         if not hm:
-            return "I couldn't read that time. Try: set wake 05:45 or set wake 5:45am"
+            return "I couldn't read that time. Try 5:45am."
         st[key] = hm
-        return f"Done. Your {key} deadline is now {hm}."
+        return f"Done, your {key} deadline is {clock(hm)}."
     if not off and not hm:
-        return "I couldn't read that time. Try 05:45 or 5:45am, or say off."
+        return "I couldn't read that time. Try 5:45am, or say off."
     st["times"][key] = "off" if off else hm
-    return f"Done. {key} is now {'off' if off else hm}."
+    return f"Done, {key} is now {'off' if off else clock(hm)}."
 
 
-# ------------------------------------------------------------------ keyboards
-
-
-def keyboard_for(st):
-    """Tap buttons, shown only when you send /menu (they hide again after one tap)."""
-    g = st["targets"]
-    r1 = []
-    if st["wake_t"] == "-":
-        r1.append(L_AWAKE)
-    if st["workout_t"] == "-":
-        r1.append(L_VIDEO)
-    if st["work_t"] == "-":
-        r1.append(L_WORK)
-    elif st["left_t"] == "-":
-        r1.append(L_LEAVE)
-    r2 = []
-    if g["water"] and st["water"] < g["water"]:
-        r2.append(f"💧 +{g['glass']} ml")
-    if g["pages"] and st["pages"] < g["pages"]:
-        r2.append("📖 +5 pages")
-    if g["outdoor"] and st["outdoor_t"] == "-":
-        r2.append(L_OUTDOOR)
-    r3 = []
-    if g["photo"] and st["photo_t"] == "-":
-        r3.append(L_PHOTO)
-    r3.append(L_FOCUS)
-    if st["mood"] == "-":
-        r3.append(L_MOOD)
-    rows = [[{"text": b} for b in r] for r in (r1, r2, r3, [L_WD, L_STATS, L_REM, L_HELP]) if r]
-    return {"keyboard": rows, "resize_keyboard": True, "one_time_keyboard": True}
-
+# ------------------------------------------------------------------ buttons
 
 REMOVE_KB = {"remove_keyboard": True}
 
@@ -913,7 +1265,7 @@ def emotion_buttons():
 
 def reminder_buttons():
     return {"inline_keyboard": [[{"text": "✅ Done", "callback_data": "done"},
-                                 {"text": "💤 Snooze 10 min", "callback_data": "snz:10"}]]}
+                                 {"text": "💤 10 min", "callback_data": "snz:10"}]]}
 
 
 def mood_buttons():
@@ -921,16 +1273,20 @@ def mood_buttons():
     return {"inline_keyboard": [[{"text": f"{faces[i]} {i + 1}", "callback_data": f"mood:{i + 1}"} for i in range(5)]]}
 
 
-BOT_COMMANDS = [("wd", "Evening wind-down: screen time, feelings, diary"), ("awake", "Log that you're up"),
-                ("atwork", "Log arriving at work"), ("leaving", "Log leaving work"), ("water", "Log water, e.g. /water 500"),
-                ("pages", "Log reading, e.g. /pages 10"), ("outdoor", "Log your outdoor workout"),
-                ("photo", "Send your progress photo"), ("video", "Log your workout video"),
-                ("focus", "Focus timer, e.g. /focus 25"), ("feel", "Quick feelings check-in"), ("mood", "Rate your mood"),
-                ("wake", "Set tomorrow's wake-up call, e.g. /wake 6:30"), ("playlist", "Set your Spotify playlists"),
-                ("diary", "Read or write your diary"), ("feelings", "Your feelings log"), ("export", "Send me my diary file"),
-                ("stats", "Streak, heatmap, trends"), ("status", "Today at a glance"), ("reminders", "Your reminders"),
-                ("menu", "Show tap buttons"), ("cancel", "Cancel what I'm asking"), ("help", "Everything I understand"),
-                ("start", "Start the Compass")]
+def wd_buttons():
+    return {"inline_keyboard": [[{"text": "Yes 🌙", "callback_data": "wd:yes"}, {"text": "Not tonight", "callback_data": "wd:no"}]]}
+
+
+def confirm_buttons(code):
+    return {"inline_keyboard": [[{"text": "✅ Yes", "callback_data": "cf:" + code}, {"text": "No", "callback_data": "cf:x"}]]}
+
+
+MUSIC_PHRASE = {"stressed": "Something calming for you 🎧", "low": "Something uplifting for you 🎧",
+                "frustrated": "Something peaceful for you 🎧", "tired": "A little energy for you 🎧",
+                "calm": "Something gentle to match 🎧", "good": "Something joyful to match 🎧", "focus": "Some focus music 🎧"}
+WHY_Q = {"good": "Love that 😊 What's making you feel good?", "calm": "Nice, calm is a good place 😌 What helped?",
+         "stressed": "I'm sorry, that's heavy 😔 What's behind the stress?", "low": "I'm here 🧡 What's behind feeling low?",
+         "frustrated": "That's rough 😤 What happened?", "tired": "Rest is coming 😴 What wore you out?"}
 
 
 # ----------------------------------------------------------------- day closing
@@ -940,23 +1296,23 @@ def close_day(st, d, test_note=False):
     """Finish day d: update streak, slips, freezes and history. Returns the verdict text."""
     st["reviewed"] = str(d)
     if d < START:
-        return "Today was a test, so nothing was counted."
+        return "Today was a test, so nothing counted."
     g = st["targets"]
     misses = []
-    for label, got, dl in (("wake", st["wake_t"], st["wake"]), ("workout video", st["workout_t"], st["workout"]),
-                           ("at work", st["work_t"], st["work"])):
+    for label, got, dl in (("wake check-in", st["wake_t"], st["wake"]), ("workout video", st["workout_t"], st["workout"]),
+                           ("getting to work", st["work_t"], st["work"])):
         if got == "-":
             misses.append(f"{label} missing")
         elif mins(got) > mins(dl):
-            misses.append(f"{label} late ({got})")
+            misses.append(f"{label} late ({clock(got)})")
     if g["water"] and st["water"] < g["water"]:
-        misses.append(f"water {st['water']}/{g['water']} ml")
+        misses.append(f"water {amt(st['water'])} of {amt(g['water'])}")
     if g["pages"] and st["pages"] < g["pages"]:
-        misses.append(f"reading {st['pages']}/{g['pages']} pages")
+        misses.append(f"reading {st['pages']} of {g['pages']} pages")
     if g["outdoor"] and st["outdoor_t"] == "-":
-        misses.append("outdoor workout missing")
+        misses.append("no outdoor workout")
     if g["photo"] and st["photo_t"] == "-":
-        misses.append("progress photo missing")
+        misses.append("no progress photo")
     if g["screen"]:
         if st["ev_date"] != str(d) or st["ev_screen"] == "-":
             misses.append("screen time not logged")
@@ -965,25 +1321,26 @@ def close_day(st, d, test_note=False):
     if not misses:
         st["streak"] += 1
         st["best"] = max(st["best"], st["streak"])
-        verdict = f"Perfect day. Streak: {st['streak']}. 🔥"
+        verdict = f"Perfect day, {NAME} 🔥 Streak: {st['streak']}."
         if st["streak"] % 7 == 0 and st["freezes"] < 3:
             st["freezes"] += 1
             verdict += f"\n🧊 You earned a streak freeze (you have {st['freezes']})."
         if st["day"] >= 75:
-            verdict += "\n🏆 75 days complete! That is a huge achievement, Joseph."
+            verdict += f"\n🏆 75 days done, {NAME}. That's huge."
         day_set(st, d, "P")
         return verdict
     st["slips"] += 1
+    why = ", ".join(misses)
     if st["slips"] <= st["free"]:
         day_set(st, d, "S")
-        return f"Slip: {', '.join(misses)}. That uses your free slip this week. Streak kept at {st['streak']}."
+        return f"A slip today: {why}. That's your free slip this week, so the streak stays at {st['streak']}."
     if st["freezes"] > 0:
         st["freezes"] -= 1
         day_set(st, d, "F")
-        return f"Slip: {', '.join(misses)}. 🧊 A streak freeze saved your streak ({st['streak']}). Freezes left: {st['freezes']}."
+        return f"A slip today: {why}. A streak freeze saved you 🧊 ({st['freezes']} left)."
     day_set(st, d, "X")
     st["streak"], st["slips"], st["day"] = 0, 0, 0
-    return f"Slip: {', '.join(misses)}. No free slips or freezes left, so the streak resets. Tomorrow is a fresh Day 1."
+    return f"A slip today: {why}. No free slips or freezes left, so the streak resets. Tomorrow is a fresh Day 1 💪"
 
 
 # -------------------------------------------------------------------- engine
@@ -1000,6 +1357,7 @@ def run(st, updates, now):
     cur = now.hour * 60 + now.minute
     test = today < START
     started = st["started"] != "-"
+    g = st["targets"]
 
     # day rollover
     roll_at = min(4 * 60 + 45, (tm(st, "wakecall") or 300) - 15)
@@ -1009,7 +1367,7 @@ def run(st, updates, now):
             try:
                 od = pdate(old)
                 if od >= START:
-                    out.append(f"I closed out yesterday for you, {NAME}. " + close_day(st, od))
+                    out.append("I closed out yesterday for you. " + close_day(st, od))
             except ValueError:
                 pass
         if today >= START:
@@ -1030,6 +1388,48 @@ def run(st, updates, now):
         if st["page"].isdigit():
             st["page"] = str(int(st["page"]) + n)
 
+    def pages_log(n):
+        pages_add(n)
+        tail = f" You're on page {st['page']}." if st["page"].isdigit() else ""
+        if g["pages"]:
+            if st["pages"] >= g["pages"]:
+                return f"📖 {st['pages']} pages today. Reading goal done 🎉" + tail
+            return f"📖 Nice, {st['pages']} of {g['pages']} pages today." + tail
+        return f"📖 {st['pages']} pages today." + tail
+
+    def set_page(newp):
+        if st["page"].isdigit() and newp > int(st["page"]):
+            return pages_log(newp - int(st["page"]))
+        st["page"] = str(newp)
+        return f"Page {newp} saved 📖"
+
+    def water_add(ml):
+        before = st["water"]
+        st["water"] = max(0, before + int(ml))
+        have = amt(st["water"])
+        goal = g["water"]
+        if ml < 0:
+            return f"Took it off 👍 {have} so far."
+        if not goal:
+            return f"💧 {have} today."
+        tot = amt(goal)
+        if before >= goal:
+            return f"💧 {have} today, goal's already done 🎉"
+        if st["water"] >= goal:
+            return f"💧 That's your {tot}. Water goal done 🎉"
+        ratio = st["water"] / float(goal)
+        if ratio >= 0.8:
+            return f"💧 {have} of {tot}, nearly there."
+        if ratio >= 0.5:
+            return f"💧 {have} of {tot}, over halfway."
+        return f"💧 Got it. {have} of {tot} so far."
+
+    def set_outdoor(t):
+        if st["outdoor_t"] == "-":
+            st["outdoor_t"] = t
+            return f"🌳 Outdoor workout logged at {clock(t)}. Great, {NAME}."
+        return f"Outdoor workout was already logged at {clock(st['outdoor_t'])} 👍"
+
     def ev_touch():
         if st["ev_date"] != str(today):
             st.update(ev_date=str(today), ev_screen="-", ev_emo="-", ev_why="-", ev_diary="-", ev_shot="-")
@@ -1037,6 +1437,12 @@ def run(st, updates, now):
     def log_diary(kind, text):
         out.append({"k": "diary_add", "ts": now.strftime("%Y-%m-%d %H:%M"), "kind": kind,
                     "text": re.sub(r"\s+", " ", text).strip()})
+
+    def add_note(text):
+        ev_touch()
+        prev = st["ev_diary"]
+        merged = text if prev == "-" else prev + " / " + text
+        st["ev_diary"] = clean(merged[-250:], 250)
 
     def clear_await():
         st["aw_state"], st["aw_emo"], st["aw_at"] = "-", "-", "-"
@@ -1049,15 +1455,20 @@ def run(st, updates, now):
 
     def ask_emotion():
         st["aw_state"], st["aw_at"] = "wd_emotion", stamp(now)
-        out.append(msg("2) How are you feeling tonight? Tap one, or type your own word.", emotion_buttons()))
+        out.append(msg("How are you feeling tonight? Tap one, or tell me in your own words.", emotion_buttons()))
 
     def ask_why(emo, solo):
         st["aw_state"], st["aw_emo"], st["aw_at"] = ("feel_why" if solo else "wd_why"), emo, stamp(now)
-        out.append(f"What's behind feeling {nice(emo)}? A few words is enough (or type skip).")
+        out.append(WHY_Q.get(emo) or f"What's behind feeling {nice(emo)}?")
+
+    def set_why(emo, why):
+        ev_touch()
+        st["ev_why"] = clean(why, 120)
+        log_diary("why", f"{nice(emo)}: {why}")
 
     def ask_diary():
         st["aw_state"], st["aw_at"] = "wd_diary", stamp(now)
-        out.append("3) Anything else on your mind? Write it as tonight's diary entry, or type done.")
+        out.append("Anything else on your mind? I'll save it to your diary. Or say done.")
 
     def record_emotion(emo):
         ev_touch()
@@ -1074,88 +1485,102 @@ def run(st, updates, now):
         if once_flag and flag in st["sent"]:
             return
         st["sent"].append(flag)
-        own = name in PLAYLISTS
-        out.append(f"🎧 Music for this moment ({name}){'' if own else ' (a search for you, set your own with: playlist ' + name + ' <link>)'}:\n{music_url(name)}")
+        out.append(f"{MUSIC_PHRASE.get(name, 'Something for the moment 🎧')}\n{music_url(name)}")
 
     def ask_wake():
         st["aw_state"], st["aw_at"] = "wd_wake", stamp(now)
         cur_wc = st["next_wake"] if st["next_wake"] != "-" else st["times"]["wakecall"]
-        out.append(f"4) What time should I wake you tomorrow? Type like 6:30 or 7am, or 'same' to keep {cur_wc}.")
+        out.append(f"What time should I wake you tomorrow? Say something like 6:30 or 7am, or \"same\" to keep {clock(cur_wc)}.")
 
     def finish_wd():
         clear_await()
         st["ev_done"] = stamp(now)
-        parts = ["🌙 Saved for tonight:"]
+        parts = []
         if st["ev_screen"] != "-":
-            line = f"• Screen time: {fmt_min(int(st['ev_screen']))}"
-            if st["targets"]["screen"]:
-                line += f" (limit {fmt_min(st['targets']['screen'])})"
-            parts.append(line)
+            parts.append(f"screen {fmt_min(int(st['ev_screen']))}")
         if st["ev_emo"] != "-":
-            parts.append(f"• Feeling: {EMO_FACE.get(st['ev_emo'], '🙂')} {nice(st['ev_emo'])}" + (f", because {st['ev_why']}" if st["ev_why"] != "-" else ""))
+            parts.append(f"{EMO_FACE.get(st['ev_emo'], '🙂')} {nice(st['ev_emo'])}")
         if st["ev_diary"] != "-":
-            parts.append("• Diary entry ✓")
-        if len(parts) == 1:
-            parts.append("• (nothing logged)")
-        if cur <= mins(REFLECT_AT):
-            parts.append(f"Your reflection arrives around {REFLECT_AT}. Everything is also in /diary.")
+            parts.append("diary ✓")
+        parts.append("wake " + clock(st["next_wake"] if st["next_wake"] != "-" else st["times"]["wakecall"]))
+        out.append("Saved 🌙 " + " · ".join(parts) + f"\nSleep well, {NAME}.")
+
+    def start_wd():
+        ev_touch()
+        st["aw_state"], st["aw_emo"], st["aw_at"] = "wd_screen", "-", stamp(now)
+        lim = g["screen"]
+        out.append(f"🌙 Let's wind down, {NAME}. How much screen time did you have today? "
+                   "Send a screenshot or just tell me, like 3h20 (or skip)."
+                   + (f" Your limit is {fmt_min(lim)}." if lim else ""))
+
+    def feeling_reply(emo, why):
+        emo = record_emotion(emo)
+        if why:
+            set_why(emo, why)
+            out.append(pick(f"{now}fr", ["Thanks for telling me 🧡 I've noted it.", "I hear you 🧡 Noted.", "Got it, that's saved 🧡"]))
         else:
-            parts.append(f"It's after {REFLECT_AT}, so tonight's reflection has passed. It's all saved in /diary.")
-        parts.append(f"Wake-up call tomorrow: {st['next_wake'] if st['next_wake'] != '-' else st['times']['wakecall']}.")
-        parts.append(f"Sleep well, {NAME}. 🌙")
-        out.append("\n".join(parts))
+            ask_why(emo, True)
+        suggest_music(emo)
 
     def handle_await(text):
         s = st["aw_state"]
         low = text.strip().lower()
-        skip = low in ("skip", "no", "none", "-", "pass", "nothing")
+        if low in ("cancel", "never mind", "nevermind", "stop", "forget it", "leave it", "not now"):
+            clear_await()
+            out.append("No worries, we'll leave it 🙂")
+            return
+        skip = low in ("skip", "no", "none", "-", "pass", "nothing", "nope", "nah", "n/a")
         if s == "wd_screen":
             if skip:
                 ask_emotion()
                 return
-            v = parse_screen(text)
+            v = parse_screen_loose(text)
             if v is None:
-                out.append("I couldn't read that. Type it like 3h20, 3.5h or 200 (minutes), or type skip.")
+                out.append("I didn't catch that. Try something like 3h20 or 200 minutes, or say skip.")
                 return
             set_screen(v)
-            lim = st["targets"]["screen"]
-            out.append(f"📱 {fmt_min(v)}" + (f" ({'over' if v > lim else 'within'} your {fmt_min(lim)} limit)." if lim else " saved."))
+            lim = g["screen"]
+            out.append(f"📱 {fmt_min(v)} noted" + ((f", within your {fmt_min(lim)} limit 👏" if v <= lim else f", a bit over your {fmt_min(lim)} limit") if lim else "."))
             ask_emotion()
         elif s == "wd_emotion":
             if skip:
                 ask_diary()
                 return
-            emo = record_emotion(text)
-            ask_why(emo, False)
+            emo, why = emotion_from(text)
+            emo = record_emotion(emo)
+            if why:
+                set_why(emo, why)
+                out.append("Thanks for telling me 🧡")
+                ask_diary()
+            else:
+                ask_why(emo, False)
             suggest_music(emo)
         elif s in ("wd_why", "feel_why"):
             emo = st["aw_emo"]
             if not skip:
-                ev_touch()
-                st["ev_why"] = clean(text, 120)
-                log_diary("why", f"{nice(emo)}: {text}")
+                set_why(emo, text)
             if s == "feel_why":
                 clear_await()
-                out.append("Saved. I'll remember it for your diary and reflection. 🧡")
+                out.append("Thanks for telling me 🧡 It's saved.")
             else:
                 ask_diary()
         elif s == "wd_diary":
-            if not (low in ("done", "skip", "no", "none", "that's all", "thats all", "nothing")):
-                ev_touch()
-                st["ev_diary"] = clean(text, 250)
+            if low not in ("done", "skip", "no", "none", "that's all", "thats all", "nothing", "nothing else", "nope", "nah"):
+                add_note(text)
                 log_diary("diary", text)
             ask_wake()
         elif s == "wd_wake":
-            if low in ("same", "skip", "keep", "no", "-", "done"):
+            if low in ("same", "skip", "keep", "no", "-", "done", "same time", "unchanged", "nothing", "nope"):
                 finish_wd()
                 return
-            hm = find_time(text if (":" in text or "m" in low) else text.strip() + ":00")[0]
+            hm = find_time_wake(text)
             if hm is None:
-                out.append("I couldn't read that time. Try 6:30 or 7am, or type same.")
+                out.append("I didn't catch the time. Try 6:30 or 7am, or say same.")
                 return
             st["next_wake"] = hm
-            out.append(f"⏰ Wake-up call set for {hm} tomorrow (awake deadline {hm_of(mins(hm) + WAKE_DEADLINE_AFTER)}).")
             finish_wd()
+        else:
+            clear_await()
 
     if st["aw_state"] != "-":
         try:
@@ -1164,131 +1589,76 @@ def run(st, updates, now):
         except ValueError:
             clear_await()
 
-    for u in updates:
-        if "callback_query" in u:
-            cq = u["callback_query"]
-            data = cq.get("data", "")
-            mtxt = (cq.get("message") or {}).get("text", "")
-            mid = (cq.get("message") or {}).get("message_id")
-            if data == "done":
-                out.append({"k": "answer", "id": cq["id"], "text": "Nice work! ✅"})
-                out.append({"k": "edit", "message_id": mid, "text": "✅ Done: " + re.sub(r"^⏰ Reminder: ", "", mtxt)})
-            elif data.startswith("snz:"):
-                mins_ahead = int(data.split(":")[1])
-                body = re.sub(r"\s*\(a bit late\)$", "", re.sub(r"^⏰ Reminder: ", "", mtxt))
-                t_, rule, text = after(now, mins_ahead, body)
-                add_reminder(st, t_, rule, text)
-                out.append({"k": "answer", "id": cq["id"], "text": f"Snoozed {mins_ahead} min 💤"})
-                out.append({"k": "edit", "message_id": mid, "text": f"💤 Snoozed until {t_}: {body}"})
-            elif data.startswith("emo:"):
-                emo = record_emotion(data.split(":", 1)[1])
-                out.append({"k": "answer", "id": cq["id"], "text": f"{nice(emo)} noted"})
-                out.append({"k": "edit", "message_id": mid, "text": f"Feeling: {EMO_FACE.get(emo, '🙂')} {nice(emo)}"})
-                ask_why(emo, st["aw_state"] != "wd_emotion")
-                suggest_music(emo)
-            elif data.startswith("mood:"):
-                n = int(data.split(":")[1])
-                st["mood"] = str(n)
-                day_set(st, today, mood=n)
-                out.append({"k": "answer", "id": cq["id"], "text": "Saved 🙂"})
-                out.append({"k": "edit", "message_id": mid, "text": f"Mood saved: {['😞', '😕', '😐', '🙂', '😄'][n - 1]} {n}/5"})
-                if n <= 2:
-                    suggest_music("low")
-            else:
-                out.append({"k": "answer", "id": cq["id"], "text": ""})
-            continue
-        m = u.get("message") or {}
-        ts = datetime.fromtimestamp(m.get("date", 0), TZ)
-        t = ts.strftime("%H:%M")
-        kind, data = classify(m)
-        seed = f"{u['update_id']}{kind}"
-        if kind == "start":
-            st["started"] = st["started"] if started else str(today)
-            started = True
-            out.append(msg(welcome_text(st, today)))
-            out.append({"k": "commands"})
-            continue
-        if not started:
-            out.append(msg("👋 Tap /start to begin."))
-            continue
-        g = st["targets"]
-        text0 = re.sub(r"^(/\w+)@\w+", r"\1", (m.get("text") or m.get("caption") or "").strip())
-        is_cmd = text0.startswith("/") or text0 in LABELS or RE_WATER_BTN.match(text0) or RE_PAGES_BTN.match(text0)
-        if (st["aw_state"] != "-" and text0 and kind not in EXPLICIT
-                and kind not in ("workout", "outdoor", "photo") and not is_cmd):
-            handle_await(text0)
-            continue
+    def act(kind, data):
         if kind == "awake":
             if st["wake_t"] == "-":
                 st["wake_t"] = t
-                out.append(ack(t, st["wake"], test, seed))
+                out.append(ack(t, st["wake"], test, seed, "up"))
             else:
-                out.append(f"Already logged you up at {st['wake_t']}. 👍")
+                out.append(f"Already have you up at {clock(st['wake_t'])} ✅")
         elif kind == "workout":
             if st["workout_t"] == "-":
                 st["workout_t"] = t
-                out.append(ack(t, st["workout"], test, seed) + " Video received. 🎥")
+                out.append(ack(t, st["workout"], test, seed, "workout"))
             else:
-                out.append(f"Another video, nice. Your workout is already logged at {st['workout_t']}. "
-                           "If this was your outdoor workout, tap 🌳 Outdoor workout.")
+                out.append(f"Nice, another one 🎥 Your workout is already in at {clock(st['workout_t'])}.")
         elif kind == "outdoor":
-            if st["outdoor_t"] == "-":
-                st["outdoor_t"] = t
-                out.append(f"🌳 Outdoor workout logged at {t}. Great, {NAME}.")
+            out.append(set_outdoor(t))
+        elif kind == "outdoor_ask":
+            if g["outdoor"] and st["outdoor_t"] == "-":
+                out.append(msg("Nice! Should that count as your outdoor workout?", confirm_buttons("o")))
             else:
-                out.append(f"Outdoor workout already logged at {st['outdoor_t']}. 👍")
+                out.append("Lovely, that's good for you 💪")
         elif kind == "photo" and st["aw_state"].startswith("wd_"):
             ev_touch()
             ph = m.get("photo") or []
             st["ev_shot"] = clean((ph[-1].get("file_id") if ph else (m.get("document") or {}).get("file_id")) or "x", 120)
-            out.append("Screenshot saved 📱." + (" Now type the total, like 3h20 (or type skip)." if st["aw_state"] == "wd_screen" else ""))
+            out.append("Screenshot saved 📱" + (" Now tell me the total, like 3h20 (or skip)." if st["aw_state"] == "wd_screen" else ""))
         elif kind == "photo":
             if st["photo_t"] == "-":
                 st["photo_t"] = t
-                out.append(f"📸 Progress photo logged at {t}.")
+                out.append(f"📸 Progress photo saved at {clock(t)}.")
             else:
-                out.append(f"Photo received. Your progress photo was already logged at {st['photo_t']}.")
+                out.append(f"Photo received 📸 (your progress photo was already in at {clock(st['photo_t'])}).")
         elif kind == "atwork":
             if st["work_t"] == "-":
                 st["work_t"] = t
-                out.append(ack(t, st["work"], test, seed))
+                out.append(ack(t, st["work"], test, seed, "work"))
             else:
-                out.append(f"Already logged you at work at {st['work_t']}. 👍")
+                out.append(f"Already have you at work from {clock(st['work_t'])} ✅")
         elif kind == "leave":
             st["left_t"] = t
             out.append(early_leave_plan(st, t))
         elif kind == "hint_video":
-            out.append("Tap 📎 and send me your workout video when you're done. 🎥")
+            out.append("Send it over whenever you're done 🎥")
         elif kind == "hint_photo":
-            out.append("Send me your progress photo now (as a photo, not a file). 📸")
+            out.append("Send it over as a photo 📸")
         elif kind == "water":
-            val, unit = data
-            if unit.startswith("glass") or (unit == "" and abs(val) <= 20):
-                ml = val * g["glass"]
-            elif unit.startswith("l"):
-                ml = val * 1000
+            ml, sure = data
+            if sure:
+                out.append(water_add(ml))
             else:
-                ml = val
-            st["water"] = max(0, st["water"] + int(ml))
-            if g["water"]:
-                pct = min(100, round(100 * st["water"] / g["water"]))
-                done = st["water"] >= g["water"]
-                out.append(f"💧 {st['water']}/{g['water']} ml ({pct}%)." + (" 🎉 Water goal reached!" if done else ""))
-            else:
-                out.append(f"💧 {st['water']} ml today.")
+                out.append(msg(f"Log {amt(ml)} of water?", confirm_buttons(f"w:{ml}")))
         elif kind == "pages":
-            pages_add(data)
-            tail = f" Now on page {st['page']}." if st["page"].isdigit() else ""
-            if g["pages"]:
-                out.append(f"📖 {st['pages']}/{g['pages']} pages today." + tail + (" 🎉 Reading goal reached!" if st["pages"] >= g["pages"] else ""))
+            n, sure = data
+            if sure:
+                out.append(pages_log(n))
             else:
-                out.append(f"📖 {st['pages']} pages today." + tail)
+                out.append(msg(f"About {n} pages? I'll log it.", confirm_buttons(f"p:{n}")))
+        elif kind == "pages_ask":
+            st["aw_state"], st["aw_at"] = "pg_page", stamp(now)
+            out.append("Nice, that feels good 📖 What page are you on now?")
+        elif kind == "page":
+            out.append(set_page(int(data)))
+        elif kind == "book_new":
+            title = clean(data, 40)
+            out.append(msg(f"Are you reading \"{title}\" now? 📚", confirm_buttons("b:" + title)))
         elif kind == "focus":
             minutes, label = data or (25, "")
             minutes = max(1, min(minutes, 180))
             t_, rule, _ = after(now, minutes, "")
-            add_reminder(st, t_, rule, f"🍅 Focus done ({minutes} min){': ' + label if label else ''}. Take a 5 min break.")
-            out.append(f"🍅 Focus started: {minutes} minutes. I'll ping you at {t_}. No phone, just the task.")
+            add_reminder(st, t_, rule, f"🍅 Time's up{': ' + label[:30] if label else ''}. Nice focus, take 5.")
+            out.append(f"🍅 {minutes} minutes, starting now. I'll ping you at {clock(t_)}.")
             suggest_music("focus")
         elif kind == "mood":
             if data:
@@ -1298,55 +1668,49 @@ def run(st, updates, now):
             else:
                 out.append(msg("How are you feeling today?", mood_buttons()))
         elif kind == "journal":
-            ev_touch()
-            st["ev_diary"] = clean(data, 250)
             log_diary("diary", data)
-            out.append("📝 Saved to your diary. /diary shows today's entries, /export sends the whole file.")
+            add_note(data)
+            out.append("Saved to your diary 📝")
         elif kind == "wd":
-            ev_touch()
-            st["aw_state"], st["aw_emo"], st["aw_at"] = "wd_screen", "-", stamp(now)
-            lim = g["screen"]
-            out.append(f"🌙 Wind-down, {NAME}. Let's close the day gently.\n"
-                       "1) Screen time today: type the total, like 3h20, 3.5h or 200 (minutes)."
-                       + (f" Your limit is {fmt_min(lim)}." if lim else "")
-                       + "\nYou can send the screenshot first if you like, or type skip. (/cancel stops anything.)")
-        elif kind == "screen":
-            v = parse_screen(data) if data else None
-            if v is None:
-                out.append("Type it like: screen 3h20, screen 3.5h or screen 200 (minutes).")
+            if st["ev_date"] == str(today) and st["ev_done"] != "-":
+                out.append(f"Already saved tonight 🌙 Sleep well, {NAME}.")
             else:
-                set_screen(v)
+                start_wd()
+        elif kind == "screen":
+            if data is None:
+                out.append("Tell me like 3h20 and I'll save it.")
+            else:
+                set_screen(data)
                 lim = g["screen"]
-                out.append(f"📱 Screen time saved: {fmt_min(v)}" + (f" ({'over' if v > lim else 'within'} your {fmt_min(lim)} limit)." if lim else "."))
-                if st["aw_state"] == "wd_screen":
-                    ask_emotion()
+                out.append(f"📱 {fmt_min(data)} noted" + ((f", within your {fmt_min(lim)} limit 👏" if data <= lim else f", a bit over your {fmt_min(lim)} limit") if lim else "."))
         elif kind == "setwake":
             st["next_wake"] = data
-            out.append(f"⏰ Tomorrow's wake-up call is set for {data} (awake deadline {hm_of(mins(data) + WAKE_DEADLINE_AFTER)}, "
-                       f"workout video by about {hm_of(mins(data) + WORKOUT_DEADLINE_AFTER)}). It applies from tomorrow morning.")
+            out.append(f"⏰ Done. I'll wake you at {clock(data)} tomorrow.")
+            if st["aw_state"] == "wd_wake":
+                finish_wd()
         elif kind == "playlist":
             parts = data.split(None, 1)
             if not parts:
-                lines = [f"• {n}: {PLAYLISTS.get(n, 'a Spotify search (set your own)')}" for n in PLAYLIST_NAMES]
-                out.append("🎧 Your music links:\n" + "\n".join(lines) + "\nSet one: playlist stressed <spotify link>  |  reset: playlist stressed reset")
+                out.append("Which one? wake, stressed, low, tired, frustrated, calm, good or focus, then the Spotify link.")
             elif parts[0].lower() not in PLAYLIST_NAMES:
-                out.append("Names: " + ", ".join(PLAYLIST_NAMES) + ". Example: playlist stressed https://open.spotify.com/playlist/...")
+                out.append("Names I know: " + ", ".join(PLAYLIST_NAMES) + ".")
             elif len(parts) == 2 and parts[1].strip().lower() == "reset":
                 out.append({"k": "playlist_set", "name": parts[0].lower(), "url": ""})
-                out.append(f"Reset: {parts[0].lower()} goes back to a Spotify search.")
+                out.append(f"Reset, {parts[0].lower()} goes back to a Spotify search.")
             elif len(parts) == 2 and re.match(r"^(https?://|spotify:)\S+$", parts[1].strip()):
                 url = parts[1].strip().split("?")[0] if "open.spotify.com" in parts[1] else parts[1].strip()
                 out.append({"k": "playlist_set", "name": parts[0].lower(), "url": url})
                 out.append(f"🎧 Saved your {parts[0].lower()} playlist.")
             else:
-                out.append("Send it like: playlist stressed https://open.spotify.com/playlist/...")
+                out.append("Send the name, then the Spotify link.")
         elif kind == "feel":
-            out.append(msg("How are you feeling right now?", emotion_buttons()))
+            if data:
+                feeling_reply(*data)
+            else:
+                out.append(msg("How are you feeling right now?", emotion_buttons()))
         elif kind == "cancel":
             clear_await()
-            out.append("Okay, cancelled.")
-        elif kind == "menu":
-            out.append(msg("Tap one 👇 (the buttons hide after you tap).", keyboard_for(st)))
+            out.append("Okay, no worries 🙂")
         elif kind == "diary_show":
             out.append({"k": "diary_show", "date": data or str(today)})
         elif kind == "feelings":
@@ -1364,32 +1728,23 @@ def run(st, updates, now):
                 b = find_time(parts[1])[0] if len(parts) > 1 else None
                 if a and b:
                     st["quiet"] = f"{a}-{b}"
-                    out.append(f"Quiet hours set: {a} to {b}. Reminders in that window wait until {b}.")
+                    out.append(f"Quiet hours: {clock(a)} to {clock(b)}. Reminders in that window wait until {clock(b)}.")
                 else:
-                    out.append("Try: quiet 22:30-05:00  or  quiet off")
+                    out.append("Tell me like 10:30pm to 5am, or say off.")
         elif kind == "buddy":
             if data.lower() == "off":
                 st["buddy"] = "off"
                 out.append("Weekly summary sharing is off.")
             elif re.fullmatch(r"-?\d{5,15}", data):
                 st["buddy"] = data
-                out.append("Done. Your weekly summary will also go to that chat. Your friend must have started this bot first.")
+                out.append("Done. Your weekly summary will go to that chat too. Your friend must have started this bot first.")
             else:
-                out.append("Try: buddy <their Telegram chat id>  or  buddy off")
+                out.append("Send me their Telegram chat id, or say off.")
         elif kind == "stats":
             out.append(stats_text(st))
         elif kind == "book":
             st["book"], st["page"] = data
-            out.append(f"Saved: {st['book']}, page {st['page']}. 📚")
-        elif kind == "page":
-            newp = int(data)
-            if st["page"].isdigit() and newp > int(st["page"]):
-                pages_add(newp - int(st["page"]))
-                prog = f" +{st['pages']} pages today" + (f" of {g['pages']}" if g["pages"] else "")
-                out.append(f"Page {newp} saved, nice reading, {NAME}.{prog}. 📖")
-            else:
-                st["page"] = str(newp)
-                out.append(f"Page {newp} saved. 📖")
+            out.append(f"Saved: {st['book']}, page {st['page']} 📚")
         elif kind == "setrule":
             out.append(apply_setrule(st, *data))
         elif kind == "remind":
@@ -1399,45 +1754,156 @@ def run(st, updates, now):
         elif kind == "rremove":
             before = len(st["reminders"])
             st["reminders"] = [r for r in st["reminders"] if r["id"] != data]
-            out.append(f"Reminder {data} removed. 🗑️" if len(st["reminders"]) < before else f"I don't have a reminder {data}. Send \"reminders\" to see the list.")
+            out.append("Removed 🗑️" if len(st["reminders"]) < before else f"I don't have a reminder number {data}.")
+        elif kind == "rremove_txt":
+            hits = [r for r in st["reminders"] if data.lower() in r["text"].lower()]
+            if len(hits) == 1:
+                st["reminders"] = [r for r in st["reminders"] if r["id"] != hits[0]["id"]]
+                out.append(f"Removed: {hits[0]['text']} 🗑️")
+            elif hits:
+                out.append("Which one? " + "; ".join(f"{r['id']}. {r['text']}" for r in hits) + "\nSay \"remove\" and its number.")
+            else:
+                out.append("I couldn't find that one.")
         elif kind == "rclear":
             n = len(st["reminders"])
             st["reminders"] = []
-            out.append(f"Cleared {n} reminder(s).")
+            out.append(f"Cleared {n} reminder{'s' if n != 1 else ''}.")
         elif kind == "redit":
             rid, rest = data
             r = next((x for x in st["reminders"] if x["id"] == rid), None)
             if not r:
-                out.append(f"I don't have a reminder {rid}. Send \"reminders\" to see the list.")
+                out.append(f"I don't have a reminder number {rid}.")
             elif rest.lower().startswith("text "):
                 r["text"] = rest[5:].replace("|", "/").strip()[:60] or r["text"]
-                out.append(f"Reminder {rid} text updated.")
+                out.append("Updated ✅")
             else:
                 hm = find_time(rest)[0]
                 if hm:
                     r["time"], r["last"] = hm, "-"
-                    out.append(f"Reminder {rid} moved to {hm}: {r['text']}")
+                    out.append(f"Moved to {clock(hm)}: {r['text']}")
                 else:
-                    out.append("I couldn't read that time. Try: change 2 to 16:30 or change 2 to 4:30pm")
+                    out.append("I couldn't read that time. Try 4:30pm.")
         elif kind == "status":
             out.append(status_text(st))
         elif kind == "help":
             out.append(help_text())
-        else:
-            out.append("Noted. I only understand check-ins and commands for now. Send /help to see them.")
+        elif kind == "chat":
+            if data == "thanks":
+                out.append(pick(seed, ["Anytime, Joseph 🙌", "Always 😊", "You've got this 💪"]))
+            elif data == "greet":
+                out.append(pick(seed, [f"Hey {NAME} 👋", "Hey you 😊 How's it going?"]))
+        elif kind == "question":
+            out.append(pick(seed, ["Good question, but that one's for Claude 😊 Ask in your chat with Claude.",
+                                   "That's one for Claude, not me 😊 Ask it in your Claude chat."]))
+        elif kind == "voice":
+            out.append("I can't listen to voice notes yet 🙈 Could you type it?")
+        elif kind == "sticker":
+            pass
+        else:  # other: keep it
+            if len(re.findall(r"\w+", text0)) >= 3:
+                log_diary("note", text0)
+                add_note(text0)
+                out.append("Saved to your diary 📝")
+            else:
+                out.append("Got it 👍")
+
+    for u in updates:
+        if "callback_query" in u:
+            cq = u["callback_query"]
+            data = cq.get("data", "")
+            mtxt = (cq.get("message") or {}).get("text", "")
+            mid = (cq.get("message") or {}).get("message_id")
+            if data == "done":
+                out.append({"k": "answer", "id": cq["id"], "text": "Nice work! ✅"})
+                out.append({"k": "edit", "message_id": mid, "text": "✅ " + re.sub(r"^(?:⏰ )?", "", re.sub(r"\s*\(a bit late\)$", "", mtxt))})
+            elif data.startswith("snz:"):
+                mins_ahead = int(data.split(":")[1])
+                body = re.sub(r"\s*\(a bit late\)$", "", re.sub(r"^⏰ ", "", mtxt))
+                t_, rule, text = after(now, mins_ahead, body)
+                add_reminder(st, t_, rule, text)
+                out.append({"k": "answer", "id": cq["id"], "text": f"Snoozed {mins_ahead} min 💤"})
+                out.append({"k": "edit", "message_id": mid, "text": f"💤 Okay, I'll nudge you again at {clock(t_)}"})
+            elif data.startswith("emo:"):
+                emo = record_emotion(data.split(":", 1)[1])
+                out.append({"k": "answer", "id": cq["id"], "text": f"{nice(emo)} noted"})
+                out.append({"k": "edit", "message_id": mid, "text": f"{EMO_FACE.get(emo, '🙂')} {nice(emo)}"})
+                ask_why(emo, st["aw_state"] != "wd_emotion")
+                suggest_music(emo)
+            elif data.startswith("mood:"):
+                n = int(data.split(":")[1])
+                st["mood"] = str(n)
+                day_set(st, today, mood=n)
+                out.append({"k": "answer", "id": cq["id"], "text": "Saved 🙂"})
+                out.append({"k": "edit", "message_id": mid, "text": f"Mood: {['😞', '😕', '😐', '🙂', '😄'][n - 1]} {n}/5"})
+                if n <= 2:
+                    suggest_music("low")
+            elif data == "wd:yes":
+                out.append({"k": "answer", "id": cq["id"], "text": ""})
+                out.append({"k": "edit", "message_id": mid, "text": "🌙 Ready to wind down? Yes"})
+                if st["ev_done"] == "-" or st["ev_date"] != str(today):
+                    start_wd()
+            elif data == "wd:no":
+                out.append({"k": "answer", "id": cq["id"], "text": "Okay 🌙"})
+                out.append({"k": "edit", "message_id": mid, "text": "Okay, rest well, " + NAME + " 🌙"})
+                st["sent"] += [f for f in ("winddown2", "winddown3") if f not in st["sent"]]
+            elif data.startswith("cf:"):
+                parts = data.split(":", 2)
+                txt = "No problem 👍"
+                try:
+                    if parts[1] == "w":
+                        txt = water_add(int(parts[2]))
+                    elif parts[1] == "p":
+                        txt = pages_log(int(parts[2]))
+                    elif parts[1] == "o":
+                        txt = set_outdoor(now.strftime("%H:%M"))
+                    elif parts[1] == "b":
+                        st["book"], st["page"] = clean(parts[2], 40), "not set"
+                        st["aw_state"], st["aw_at"] = "pg_page", stamp(now)
+                        txt = f"Got it, {st['book']} 📚 What page are you on?"
+                except (ValueError, IndexError):
+                    pass
+                out.append({"k": "answer", "id": cq["id"], "text": ""})
+                out.append({"k": "edit", "message_id": mid, "text": txt})
+            else:
+                out.append({"k": "answer", "id": cq["id"], "text": ""})
+            continue
+        m = u.get("message") or {}
+        ts = datetime.fromtimestamp(m.get("date", 0), TZ)
+        t = ts.strftime("%H:%M")
+        kind, data = classify(m, g["glass"])
+        seed = f"{u['update_id']}{kind}"
+        is_media = "video" in m or "video_note" in m or "photo" in m or str((m.get("document") or {}).get("mime_type", "")).startswith(("video", "image"))
+        if kind == "start" or not started:
+            if not started:
+                st["started"] = str(today)
+                started = True
+            out.append(msg(welcome_text(st, today)))
+            out.append({"k": "commands"})
+            continue
+        text0 = re.sub(r"^(/\w+)@\w+", r"\1", (m.get("text") or m.get("caption") or "").strip())
+        if st["aw_state"] == "pg_page" and text0 and not is_media:
+            mm = re.fullmatch(r"\s*(?:page\s*|pg\.?\s*|p\.?\s*)?(\d{1,4})\s*[.!]?\s*", text0, re.I)
+            clear_await()
+            if mm:
+                out.append(set_page(int(mm[1])))
+                continue
+        if (st["aw_state"] != "-" and text0 and kind not in EXPLICIT and not is_media):
+            handle_await(text0)
+            continue
+        items = data if kind == "multi" else [(kind, data)]
+        for kind, data in items:
+            act(kind, data)
 
     if not started:
         wc = tm(st, "wakecall")
         if today >= START and wc is not None and wc <= cur <= wc + 180 and "startnudge" not in st["sent"]:
-            out.append(msg(f"👋 Good morning, {NAME}! Tap /start to switch your Compass on for today."))
+            out.append(msg(f"Hey {NAME} 👋 Say hi and I'll switch your Compass on for today."))
             st["sent"].append("startnudge")
         return st, out, voice
 
     if st["cmdver"] != CMDVER:
         st["cmdver"] = CMDVER
         out.append({"k": "commands"})
-        out.append("🆕 Updated! Type / to see every command. /menu shows tap buttons (they only appear when you ask). "
-                   "/wd starts your evening wind-down: screen time, feelings and why, and your diary.")
 
     # custom reminders (work every day, including test days). Quiet hours defer them to the morning.
     keep = []
@@ -1452,7 +1918,8 @@ def run(st, updates, now):
                 d = today - timedelta(days=1)
         if rule_matches(r["rule"], d) and r["last"] != str(d) and eff <= cur <= eff + 120:
             late = " (a bit late)" if cur - eff > 10 else ""
-            out.append(msg(f"⏰ Reminder: {r['text']}{late}", reminder_buttons()))
+            lead = "" if r["text"][:1] in ("🍅", "⏱") else "⏰ "
+            out.append(msg(f"{lead}{r['text']}{late}", reminder_buttons()))
             r["last"] = str(d)
             if is_once(r["rule"]):
                 continue
@@ -1479,47 +1946,44 @@ def run(st, updates, now):
     wake_d, work_out_d, work_d = mins(st["wake"]), mins(st["workout"]), mins(st["work"])
     once("wakecall", tm(st, "wakecall"), True, wake_call(st), 6 * 60)
     once("wakenudge", wake_d + 1, st["wake_t"] == "-",
-         f"It's past {st['wake']}, {NAME}. Text me you're up and get moving. ⏰", 120)
+         f"It's past {clock(st['wake'])}, {NAME}. Are you up? ⏰", 120)
     once("wakenudge2", wake_d + 45, st["wake_t"] == "-",
-         f"{NAME}, still nothing from you. Up now, workout next.", 120)
+         f"{NAME}, I haven't heard from you 😅 Up and moving, workout's next.", 120)
     once("workoutask", work_out_d - 30, st["wake_t"] != "-" and st["workout_t"] == "-",
-         f"Workout video deadline is {st['workout']}, {NAME}. 30 minutes left.", 29)
+         f"30 minutes left for your workout video, {NAME}.", 29)
     once("workoutnudge", work_out_d + 1, st["workout_t"] == "-",
-         f"Workout video deadline passed ({st['workout']}). Send it when it's done, {NAME}. And remember to text me when you get to work by {st['work']}.", 120)
+         "The workout deadline has passed. Send the video when you're done, and tell me when you reach work.", 120)
     once("worknudge", work_d + 1, st["work_t"] == "-",
-         f"It's past {st['work']}, {NAME}. Text me when you're at work.", 120)
-    g = st["targets"]
+         f"It's past {clock(st['work'])}. Are you at work yet?", 120)
     open_tasks = []
     if g["water"] and st["water"] < g["water"]:
-        open_tasks.append(f"💧 {st['water']}/{g['water']} ml")
+        open_tasks.append(f"💧 {amt(st['water'])} of {amt(g['water'])}")
     if g["pages"] and st["pages"] < g["pages"]:
-        open_tasks.append(f"📖 {st['pages']}/{g['pages']} pages")
+        open_tasks.append(f"📖 {st['pages']} of {g['pages']} pages")
     if g["outdoor"] and st["outdoor_t"] == "-":
         open_tasks.append("🌳 outdoor workout")
     if g["photo"] and st["photo_t"] == "-":
         open_tasks.append("📸 photo")
-    midday_txt = pick(f"{st['today']}md", [f"Midday check, {NAME}. How's the day going?", f"Halfway there, {NAME}. Stay on it."])
+    midday_txt = pick(f"{st['today']}md", [f"Midday check, {NAME} 🌤️ How's the day going?", f"Halfway there, {NAME}. Stay on it 💪"])
     if open_tasks:
-        midday_txt += " Still open: " + ", ".join(open_tasks) + "."
+        midday_txt += "\nStill open: " + ", ".join(open_tasks)
     once("midday", tm(st, "midday"), True, midday_txt, 120)
     once("leavecheck", tm(st, "leavecheck"), st["left_t"] == "-",
-         f"How's work, {NAME}? Tap 🚪 Leaving work when you leave and I'll plan your evening.", 120)
+         f"How's work, {NAME}? Tell me when you head out and I'll help plan your evening.", 120)
 
     wd_done = st["ev_date"] == str(today) and st["ev_done"] != "-"
     wdt = tm(st, "winddown")
-    once("winddown", wdt, not wd_done,
-         f"🌙 Evening, {NAME}. Ready to wind down? Send /wd: screen time, how you feel and why, your diary, and tomorrow's wake-up time.", 120)
+    once("winddown", wdt, not wd_done, msg("🌙 Ready to wind down?", wd_buttons()), 120)
     once("winddown2", None if wdt is None else wdt + 30, not wd_done and "winddown" in st["sent"],
-         "Still up? Whenever you're ready, /wd takes about two minutes.", 60)
+         msg("Still up? Whenever you're ready 🌙", wd_buttons()), 60)
     once("winddown3", None if wdt is None else wdt + 60, not wd_done and "winddown" in st["sent"],
-         "Last nudge for tonight: /wd, then rest. Tomorrow starts early.", 60)
+         msg("Last nudge for tonight, then rest. Tomorrow starts early.", wd_buttons()), 60)
 
     rv = tm(st, "review")
     if rv is not None and "review" not in st["sent"] and rv <= cur <= rv + 179 and st["reviewed"] != str(today):
         verdict = close_day(st, today)
-        left = max(st["free"] - st["slips"], 0)
-        out.append(f"Evening review, {NAME}.\n{verdict}\nFree slips left this week: {left}.\n"
-                   f"Tomorrow: up by {st['wake']}. Tap 😊 Mood and tell me about your day with journal: <one line>. 📖")
+        nxt = hm_of(mins(st["next_wake"]) + WAKE_DEADLINE_AFTER) if st["next_wake"] != "-" else st["wake"]
+        out.append(f"{verdict}\nTomorrow: up by {clock(nxt)}.")
         st["sent"].append("review")
         if today.weekday() == 6 and "weekly" not in st["sent"]:
             wk = weekly_text(st, today)
@@ -1532,7 +1996,7 @@ def run(st, updates, now):
 
 # ------------------------------------------------------------------- telegram
 
-WRITES = ("sendMessage", "editMessageText", "pinChatMessage", "answerCallbackQuery", "setMyCommands")
+WRITES = ("sendMessage", "editMessageText", "pinChatMessage", "answerCallbackQuery", "setMyCommands", "deleteMyCommands")
 
 
 class Telegram:
@@ -1658,17 +2122,17 @@ def deliver(tg, chat, st, out):
             if sel:
                 send_long(tg, f"📓 Your diary for {d}:\n" + "\n".join(sel), REMOVE_KB)
             elif lines:
-                send_long(tg, f"📓 Nothing for {d} yet. Your latest entries:\n" + "\n".join(lines[-12:]), REMOVE_KB)
+                send_long(tg, f"📓 Nothing for {d} yet. Here's your latest:\n" + "\n".join(lines[-12:]), REMOVE_KB)
             else:
-                tg.send("📓 Your diary is empty. Run /wd, or write one with: /diary <text>", REMOVE_KB)
+                tg.send("📓 Your diary is empty so far. Tell me about your day and I'll keep it.", REMOVE_KB)
         elif item["k"] == "feelings":
             sel = [x for x in diary_lines() if "] feeling:" in x or "] why:" in x][-24:]
-            send_long(tg, ("🧡 Your feelings log:\n" + "\n".join(sel)) if sel else "🧡 No feelings logged yet. Try /feel or /wd.", REMOVE_KB)
+            send_long(tg, ("🧡 Your feelings lately:\n" + "\n".join(sel)) if sel else "🧡 No feelings logged yet. Tell me how you're feeling any time.", REMOVE_KB)
         elif item["k"] == "export":
             if diary_lines():
                 tg.send_document(DIARY, "📓 Your diary")
             else:
-                tg.send("📓 Your diary is empty, so there's nothing to export yet.", REMOVE_KB)
+                tg.send("📓 Your diary is empty, so there's nothing to send yet.", REMOVE_KB)
         elif item["k"] == "edit":
             tg.call("editMessageText", chat_id=chat, message_id=item["message_id"], text=item["text"],
                     reply_markup=json.dumps({"inline_keyboard": []}))
@@ -1677,7 +2141,7 @@ def deliver(tg, chat, st, out):
         elif item["k"] == "buddy":
             tg.send(item["text"], chat=item["to"])
         elif item["k"] == "commands":
-            tg.call("setMyCommands", commands=json.dumps([{"command": c, "description": d} for c, d in BOT_COMMANDS]))
+            tg.call("deleteMyCommands")  # no command menu: the chat should look like a normal chat
 
 
 BACKUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_backup.txt")
