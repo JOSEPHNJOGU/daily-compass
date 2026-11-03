@@ -1159,7 +1159,67 @@ def cycle(tg, chat, dry, fake_now=None, poll=0):
     return True
 
 
+def hard_stop(seconds):
+    """Kill this process after `seconds` no matter what (a hung connection must never hold the lock)."""
+    try:
+        import signal
+        signal.alarm(seconds)  # default SIGALRM action ends the process, which releases the lock
+    except (ImportError, AttributeError):
+        pass
+
+
+def take_lock(path):
+    """Return an open lock file, or None if a healthy copy is already listening.
+    A holder that stopped updating the file for 100+ seconds is stuck: it gets killed and replaced."""
+    import time
+    try:
+        import fcntl
+    except ImportError:
+        return open(path, "w")
+    for attempt in range(2):
+        f = open(path, "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f.seek(0)
+            f.truncate()
+            f.write(f"{os.getpid()} {int(time.time())}")
+            f.flush()
+            return f
+        except OSError:
+            f.seek(0)
+            info = f.read().split()
+            age = time.time() - int(info[1]) if len(info) == 2 and info[1].isdigit() else 999
+            if attempt == 0 and age > 100:
+                print(f"stale lock (holder {info[:1]}, {int(age)}s old): replacing it")
+                try:
+                    import signal
+                    os.kill(int(info[0]), signal.SIGKILL)
+                except Exception:
+                    pass
+                time.sleep(2)
+                try:  # a fresh file also frees us if the old holder could not be killed
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            return None
+    return None
+
+
+def heartbeat(lock):
+    import time
+    try:
+        lock.seek(0)
+        lock.truncate()
+        lock.write(f"{os.getpid()} {int(time.time())}")
+        lock.flush()
+    except Exception:
+        pass
+
+
 def main():
+    import socket
+    socket.setdefaulttimeout(30)
     load_env_file()
     token, chat = os.environ["TELEGRAM_TOKEN"], os.environ["CHAT_ID"]
     dry = os.environ.get("DRY_RUN") == "1"
@@ -1190,22 +1250,19 @@ def main():
 
     if "--loop" in sys.argv:
         import time
-        try:
-            import fcntl
-            lock = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".lock"), "w")
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except ImportError:
-            pass
-        except OSError:
+        lock = take_lock(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".lock"))
+        if lock is None:
             print("another copy is already listening, exiting")
             return
         idx = sys.argv.index("--loop") + 1
         seconds = int(sys.argv[idx]) if idx < len(sys.argv) and sys.argv[idx].isdigit() else 58
+        hard_stop(seconds + 25)
         end = time.time() + seconds
         while True:
             left = end - time.time()
             if left <= 3:
                 break
+            heartbeat(lock)
             try:
                 ok = cycle(tg, chat, dry, fake_now, poll=int(min(10, left - 2)))
             except Exception as e:  # keep listening through brief network errors
@@ -1215,6 +1272,7 @@ def main():
                 time.sleep(2)
         return
 
+    hard_stop(75)
     if not cycle(tg, chat, dry, fake_now):
         sys.exit(1)
 
