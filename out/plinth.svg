@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1180" font-family="Arial, sans-serif">
+<rect width="900" height="1180" fill="#fff"/>
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8z" fill="#444"/></marker></defs>
+<text x="450" y="38" font-size="24" font-weight="bold" text-anchor="middle">Raised plinth box for the gas hob</text>
+<text x="450" y="62" font-size="14" text-anchor="middle" fill="#555">Sizes are typical. Measure YOUR hob body (under the flange) before cutting.</text>
+
+<!-- DIAGRAM 1 FRONT SECTION -->
+<text x="40" y="105" font-size="18" font-weight="bold">1. Front section (cut through the box)</text>
+<!-- counter -->
+<rect x="60" y="400" width="780" height="22" fill="#cfcfcf" stroke="#444"/>
+<text x="70" y="440" font-size="12" fill="#555">existing counter (tile / concrete)</text>
+<!-- box walls -->
+<rect x="150" y="270" width="22" height="130" fill="#d9b382" stroke="#444"/>
+<rect x="728" y="270" width="22" height="130" fill="#d9b382" stroke="#444"/>
+<!-- top panel with opening -->
+<rect x="130" y="248" width="120" height="22" fill="#d9b382" stroke="#444"/>
+<rect x="650" y="248" width="120" height="22" fill="#d9b382" stroke="#444"/>
+<!-- hob flange -->
+<rect x="110" y="226" width="680" height="22" fill="#b8bcc2" stroke="#333"/>
+<!-- hob body -->
+<rect x="250" y="248" width="400" height="95" fill="#9aa0a8" stroke="#333"/>
+<text x="450" y="300" font-size="14" text-anchor="middle" fill="#fff">HOB BODY (burners above)</text>
+<!-- grates -->
+<rect x="270" y="205" width="360" height="21" fill="#222"/>
+<text x="450" y="219" font-size="11" text-anchor="middle" fill="#fff">pan supports</text>
+<!-- nozzle -->
+<rect x="268" y="343" width="14" height="38" fill="#888" stroke="#333"/>
+<text x="275" y="395" font-size="12" text-anchor="middle" fill="#c00">nozzle</text>
+<!-- hose -->
+<path d="M275,381 C275,420 220,400 190,380" fill="none" stroke="#b33" stroke-width="5"/>
+<!-- hatch -->
+<rect x="150" y="355" width="0" height="0"/>
+<!-- inner void -->
+<text x="450" y="375" font-size="13" text-anchor="middle" fill="#555">empty space inside box (min 3 cm under nozzle)</text>
+<!-- dims -->
+<line x1="150" y1="445" x2="750" y2="445" stroke="#444" marker-start="url(#a)" marker-end="url(#a)"/>
+<text x="450" y="462" font-size="13" text-anchor="middle">Outer box width = hob flange width minus about 2 cm each side (about 56 cm)</text>
+<line x1="800" y1="248" x2="800" y2="400" stroke="#444" marker-start="url(#a)" marker-end="url(#a)"/>
+<text x="808" y="330" font-size="13">box</text><text x="808" y="346" font-size="13">height</text><text x="808" y="362" font-size="13">about</text><text x="808" y="378" font-size="13">12 to 15 cm</text>
+<text x="60" y="190" font-size="13" fill="#555">Flange rests on top panel. Body drops through the opening.</text>
+<line x1="110" y1="194" x2="150" y2="224" stroke="#555" marker-end="url(#a)"/>
+
+<!-- DIAGRAM 2 TOP VIEW -->
+<text x="40" y="520" font-size="18" font-weight="bold">2. Top view (what you cut)</text>
+<rect x="150" y="545" width="600" height="300" fill="#d9b382" stroke="#444" stroke-width="2"/>
+<rect x="210" y="580" width="480" height="230" fill="#fff" stroke="#c00" stroke-width="2" stroke-dasharray="8 5"/>
+<text x="450" y="700" font-size="15" text-anchor="middle" fill="#c00">Opening for hob body</text>
+<text x="450" y="720" font-size="13" text-anchor="middle" fill="#c00">(about 3 mm bigger than body each side)</text>
+<text x="450" y="745" font-size="12" text-anchor="middle" fill="#555">Flange overlaps this edge by 2 to 3 cm</text>
+<!-- nozzle notch -->
+<rect x="150" y="740" width="60" height="50" fill="#fff" stroke="#c00" stroke-dasharray="6 4"/>
+<text x="180" y="770" font-size="11" text-anchor="middle" fill="#c00">hose</text>
+<text x="180" y="783" font-size="11" text-anchor="middle" fill="#c00">notch</text>
+<line x1="150" y1="870" x2="750" y2="870" stroke="#444" marker-start="url(#a)" marker-end="url(#a)"/>
+<text x="450" y="888" font-size="13" text-anchor="middle">Panel width about 56 cm (match your hob)</text>
+<line x1="110" y1="545" x2="110" y2="845" stroke="#444" marker-start="url(#a)" marker-end="url(#a)"/>
+<text x="100" y="700" font-size="13" text-anchor="end">about</text><text x="100" y="716" font-size="13" text-anchor="end">34 cm</text>
+<text x="770" y="580" font-size="13" fill="#555">Back wall</text>
+<text x="770" y="860" font-size="13" fill="#555">Front</text>
+
+<!-- DIAGRAM 3 BOX ASSEMBLY -->
+<text x="40" y="940" font-size="18" font-weight="bold">3. Assembly and finish</text>
+<g font-size="14">
+<text x="40" y="975">A. Top panel: 18 mm marine ply or steel sheet, with the hob opening and a notch for the nozzle.</text>
+<text x="40" y="1000">B. Four side walls glued and screwed. Cut a 6 cm hose gap in the back or side wall.</text>
+<text x="40" y="1025">C. Line the inside and underside of the top panel with aluminium sheet or cement board (heat shield).</text>
+<text x="40" y="1050">D. Skin outside with tile, laminate or stainless sheet so it matches your kitchen.</text>
+<text x="40" y="1075">E. Add 2 vent slots (2 x 10 cm) low on the box, so gas or heat cannot build up.</text>
+<text x="40" y="1100">F. Fix box to the counter with screws or silicone. Drop the hob in and clamp it from below.</text>
+<text x="40" y="1135" fill="#c00" font-weight="bold">Keep a metal or cement liner between the hob and any timber, and never block the vents.</text>
+</g>
+</svg>
