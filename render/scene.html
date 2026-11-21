@@ -1,0 +1,100 @@
+<!doctype html><html><body style="margin:0;background:#ddd">
+<canvas id="c" width="1400" height="1000"></canvas>
+<script type="importmap">{"imports":{"three":"./node_modules/three/build/three.module.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {RoomEnvironment} from './node_modules/three/examples/jsm/environments/RoomEnvironment.js';
+const mode = new URLSearchParams(location.search).get('mode'); // outside | cutaway
+const r = new THREE.WebGLRenderer({canvas:document.getElementById('c'),antialias:true,preserveDrawingBuffer:true});
+r.shadowMap.enabled=true; r.shadowMap.type=THREE.PCFSoftShadowMap;
+r.toneMapping=THREE.ACESFilmicToneMapping; r.outputColorSpace=THREE.SRGBColorSpace;
+const s=new THREE.Scene(); const pm=new THREE.PMREMGenerator(r); s.environment=pm.fromScene(new RoomEnvironment(),0.04).texture; s.environmentIntensity=.9; s.background=new THREE.Color(0xe9e6e1);
+const M=(c,o={})=>new THREE.MeshStandardMaterial(Object.assign({color:c,roughness:.6,metalness:0},o));
+const add=(g,m,x,y,z,sh=true)=>{const o=new THREE.Mesh(g,m);o.position.set(x,y,z);o.castShadow=o.receiveShadow=sh;s.add(o);return o;};
+const B=(w,h,d)=>new THREE.BoxGeometry(w,h,d);
+// units in cm
+// floor/counter slab
+add(B(120,5,70),M(0xc9c6c0,{roughness:.25}),0,-2.5,0);
+// wall + backsplash tiles
+add(B(120,70,2),M(0xf4f3f0,{roughness:.3}),0,35,-36);
+for(let i=1;i<8;i++) add(B(.25,70,2.1),M(0xbdbab4),-60+i*15,35,-36);
+for(let j=1;j<5;j++) add(B(120,.25,2.1),M(0xbdbab4),0,j*15,-36);
+// plinth box
+const W=56,D=34,H=13,T=1.8;
+const wood=M(0xd8c0a0,{roughness:.8}); const tile=M(0x8a8f94,{roughness:.35});
+const cx=0,cz=0;
+// side walls (tile skinned)
+add(B(T,H,D),tile,-W/2+T/2,H/2,cz);
+add(B(T,H,D),tile, W/2-T/2,H/2,cz);
+add(B(W,H,T),tile,cx,H/2,-D/2+T/2);
+if(mode!=='cutaway') add(B(W,H,T),tile,cx,H/2,D/2-T/2);
+// vent slots on front (dark) when outside
+if(mode!=='cutaway'){ for(const x of [-14,14]) add(B(10,1.2,.3),M(0x111111),x,3.5,D/2+.05); }
+// top panel with opening
+const ow=W-12,od=D-8; // opening
+const ty=H+T/2;
+add(B(W,T,(D-od)/2),wood,0,ty,-(od/2+(D-od)/4));
+add(B(W,T,(D-od)/2),wood,0,ty, (od/2+(D-od)/4));
+add(B((W-ow)/2,T,od),wood,-(ow/2+(W-ow)/4),ty,0);
+add(B((W-ow)/2,T,od),wood, (ow/2+(W-ow)/4),ty,0);
+// hob
+const steel=M(0xc4c8cc,{metalness:.85,roughness:.35});
+const fw=59,fd=36;
+add(B(fw,.9,fd),steel,0,H+T+.45,0);
+// hob body (inside box)
+const body=add(B(ow-.6,8,od-.6),M(0x9aa0a6,{metalness:.7,roughness:.45}),0,H+T-4,0);
+if(mode==='cutaway'){ 
+  // show body as wireframe outline
+  // solid underside plate
+  add(B(ow-.6,.4,od-.6),M(0x8d939a,{metalness:.7,roughness:.5}),0,H+T-8,0);
+}
+// burners
+const blk=M(0x151515,{roughness:.5}); const burnerY=H+T+.9;
+function burner(x,z,rad){
+  add(new THREE.CylinderGeometry(rad+2.2,rad+2.2,.3,48),M(0xdadde0,{metalness:.9,roughness:.25}),x,burnerY+.15,z);
+  add(new THREE.CylinderGeometry(rad,rad,1.6,48),M(0xb9bdc1,{metalness:.9,roughness:.3}),x,burnerY+.9,z);
+  add(new THREE.CylinderGeometry(rad*.72,rad*.72,.9,48),blk,x,burnerY+2.1,z);
+}
+burner(-11,0,5.5); burner(10,2,4.2);
+// grate (cast iron)
+const gy=burnerY+3.6;
+const bars=[[-27,0,.9,.9,32],[27,0,.9,.9,32]];
+const gm=M(0x1b1b1b,{roughness:.6,metalness:.4});
+add(B(52,1.1,1.1),gm,0,gy,-15); add(B(52,1.1,1.1),gm,0,gy,15);
+add(B(1.1,1.1,31),gm,-26,gy,0); add(B(1.1,1.1,31),gm,26,gy,0);
+add(B(1.1,1.1,31),gm,0,gy,0);
+for(const x of [-26,0,26]) for(const z of [-15,15]) add(B(1.6,2.8,1.6),gm,x,gy-1.2,z);
+add(B(52,1.1,1.1),gm,0,gy,0);
+// knobs on right of flange
+const kn=M(0xb5b9bd,{metalness:.9,roughness:.22});
+for(const z of [-8,7]){ add(new THREE.CylinderGeometry(2.2,2.4,2.4,32),kn,25.5,H+T+1.8,z);
+  add(new THREE.CylinderGeometry(1.2,1.2,.2,32),M(0x777b80,{metalness:.9}),25.5,H+T+3.1,z);}
+// label
+add(B(7,.05,3),M(0xffffff),19,H+T+.95,13);
+// gas hose & nozzle inside box
+if(mode==='cutaway'){
+  add(new THREE.CylinderGeometry(.8,.8,5,16),M(0xa9a49a,{metalness:.9,roughness:.3}),-24,H+T-10.8,5);
+  const curve=new THREE.CatmullRomCurve3([new THREE.Vector3(-24,H+T-13.5,5),new THREE.Vector3(-24,6,5),new THREE.Vector3(-26,3.8,10),new THREE.Vector3(-29,3.5,10)]);
+  add(new THREE.TubeGeometry(curve,40,1.15,12),M(0xb52a22,{roughness:.5}),0,0,0);
+  // jubilee clip
+  add(new THREE.CylinderGeometry(1.35,1.35,.8,16),M(0xcccccc,{metalness:.9,roughness:.3}),-24,H+T-12.8,5);
+}
+// outside: braided hose coming from back through gap to a cylinder hint
+if(mode!=='cutaway'){
+  const curve=new THREE.CatmullRomCurve3([new THREE.Vector3(-26,5,-D/2+2),new THREE.Vector3(-26,1.2,-D/2-6),new THREE.Vector3(-40,1.2,-28),new THREE.Vector3(-50,3,-20)]);
+  add(new THREE.TubeGeometry(curve,40,1.1,12),M(0xb52a22,{roughness:.5}),0,0,0);
+  add(B(8,1,2),M(0x222222),-26,4.6,-D/2+.3);
+}
+// pot for realism (outside only)
+if(mode!=='cutaway'){
+  const pot=add(new THREE.CylinderGeometry(9,9,10,48),M(0xd9dcdf,{metalness:.8,roughness:.4}),-11,gy+5.6,0);
+  add(B(8,1,1.6),M(0x222222),-23,gy+9,0);
+}
+// lights
+s.add(new THREE.HemisphereLight(0xffffff,0xb8b3aa,1.1));
+const L=new THREE.DirectionalLight(0xfff3e0,2.2); L.position.set(40,90,60); L.castShadow=true;
+L.shadow.mapSize.set(2048,2048); Object.assign(L.shadow.camera,{left:-80,right:80,top:80,bottom:-80,far:300}); L.shadow.radius=4; s.add(L);
+const cam=new THREE.PerspectiveCamera(35,1.4,1,500);
+if(mode==='cutaway'){ cam.position.set(30,48,92); cam.lookAt(-4,10,6);} else {cam.position.set(48,62,98); cam.lookAt(0,10,0);}
+r.render(s,cam); window.done=true;
+</script></body></html>
